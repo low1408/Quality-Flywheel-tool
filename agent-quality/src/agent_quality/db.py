@@ -127,7 +127,8 @@ CREATE TABLE IF NOT EXISTS failure_clusters (
     last_seen_at TEXT,
     occurrence_count INTEGER DEFAULT 0,
     proposed_intervention TEXT,
-    linked_regression_case TEXT
+    linked_regression_case TEXT,
+    provider_extensions TEXT
 );
 CREATE TABLE IF NOT EXISTS provider_artifacts (
     id TEXT PRIMARY KEY,
@@ -152,12 +153,51 @@ CREATE TABLE IF NOT EXISTS provider_artifact_revisions (
     created_at TEXT NOT NULL,
     FOREIGN KEY(artifact_id) REFERENCES provider_artifacts(id)
 );
+CREATE TABLE IF NOT EXISTS analysis_runs (
+    id TEXT PRIMARY KEY,
+    algorithm TEXT NOT NULL,
+    parameters TEXT,
+    judge_version TEXT,
+    redaction_version TEXT,
+    created_at TEXT NOT NULL,
+    status TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS failure_cluster_memberships (
+    analysis_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    cluster_id TEXT NOT NULL,
+    assignment_type TEXT NOT NULL,
+    confidence REAL,
+    PRIMARY KEY (analysis_id, run_id, cluster_id),
+    FOREIGN KEY(analysis_id) REFERENCES analysis_runs(id) ON DELETE CASCADE,
+    FOREIGN KEY(run_id) REFERENCES runs(id) ON DELETE CASCADE,
+    FOREIGN KEY(cluster_id) REFERENCES failure_clusters(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS failure_instances (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    cluster_id TEXT,
+    category TEXT,
+    subcategory TEXT,
+    description TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    probable_cause TEXT,
+    suggested_fix TEXT,
+    affected_prompt_component TEXT,
+    timestamp TEXT NOT NULL,
+    llm_judge_score REAL,
+    FOREIGN KEY(run_id) REFERENCES runs(id) ON DELETE CASCADE,
+    FOREIGN KEY(cluster_id) REFERENCES failure_clusters(id) ON DELETE SET NULL
+);
 CREATE INDEX IF NOT EXISTS idx_runs_session_id ON runs (session_id);
 CREATE INDEX IF NOT EXISTS idx_events_run_id ON events (run_id);
 CREATE INDEX IF NOT EXISTS idx_artifacts_run_id ON artifacts (run_id);
 CREATE INDEX IF NOT EXISTS idx_verifier_results_run_id ON verifier_results (run_id);
 CREATE INDEX IF NOT EXISTS idx_human_reviews_run_id ON human_reviews (run_id);
 CREATE INDEX IF NOT EXISTS idx_provider_artifact_revisions_artifact_id ON provider_artifact_revisions (artifact_id);
+CREATE INDEX IF NOT EXISTS idx_failure_instances_run_id ON failure_instances (run_id);
+CREATE INDEX IF NOT EXISTS idx_failure_instances_cluster_id ON failure_instances (cluster_id);
+
 """
 
 TABLE_SCHEMAS: dict[str, frozenset[str]] = {
@@ -278,6 +318,7 @@ TABLE_SCHEMAS: dict[str, frozenset[str]] = {
             "occurrence_count",
             "proposed_intervention",
             "linked_regression_case",
+            "provider_extensions",
         }
     ),
     "provider_artifacts": frozenset(
@@ -306,7 +347,61 @@ TABLE_SCHEMAS: dict[str, frozenset[str]] = {
             "created_at",
         }
     ),
+    "analysis_runs": frozenset(
+        {
+            "id",
+            "algorithm",
+            "parameters",
+            "judge_version",
+            "redaction_version",
+            "created_at",
+            "status",
+        }
+    ),
+    "failure_cluster_memberships": frozenset(
+        {
+            "analysis_id",
+            "run_id",
+            "cluster_id",
+            "assignment_type",
+            "confidence",
+        }
+    ),
+    "failure_instances": frozenset(
+        {
+            "id",
+            "run_id",
+            "cluster_id",
+            "category",
+            "subcategory",
+            "description",
+            "severity",
+            "probable_cause",
+            "suggested_fix",
+            "affected_prompt_component",
+            "timestamp",
+            "llm_judge_score",
+        }
+    ),
 }
+
+
+def _auto_redact(val: Any) -> Any:
+    if isinstance(val, str):
+        if (val.startswith("{") and val.endswith("}")) or (val.startswith("[") and val.endswith("]")):
+            try:
+                parsed = json.loads(val)
+                if isinstance(parsed, (dict, list)):
+                    from agent_quality.privacy.redaction import redact_json
+                    return json.dumps(redact_json(parsed).value, sort_keys=True)
+            except Exception:
+                pass
+        from agent_quality.privacy.redaction import redact_text
+        return redact_text(val).value
+    elif isinstance(val, (dict, list)):
+        from agent_quality.privacy.redaction import redact_json
+        return redact_json(val).value
+    return val
 
 
 def connect(path: Path | str | None = None) -> sqlite3.Connection:
@@ -318,13 +413,18 @@ def connect(path: Path | str | None = None) -> sqlite3.Connection:
     return conn
 
 
-def insert(conn: sqlite3.Connection, table: str, values: dict[str, Any]) -> None:
+def insert(conn: sqlite3.Connection, table: str, values: dict[str, Any], or_action: str | None = None) -> None:
     columns = list(values)
     _validate_table_columns(table, columns)
+    
+    # Auto-redact string values to prevent leakage
+    redacted_values = {col: _auto_redact(val) for col, val in values.items()}
+    
     placeholders = ", ".join("?" for _ in columns)
+    prefix = f"INSERT {or_action}" if or_action else "INSERT"
     conn.execute(
-        f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders})",
-        [values[column] for column in columns],
+        f"{prefix} INTO {table} ({', '.join(columns)}) VALUES ({placeholders})",
+        [redacted_values[column] for column in columns],
     )
 
 
@@ -332,8 +432,12 @@ def update_run(conn: sqlite3.Connection, run_id: str, **values: Any) -> None:
     if not values:
         return
     _validate_table_columns("runs", values)
-    assignments = ", ".join(f"{column}=?" for column in values)
-    conn.execute(f"UPDATE runs SET {assignments} WHERE id=?", [*values.values(), run_id])
+    
+    # Auto-redact string values
+    redacted_values = {col: _auto_redact(val) for col, val in values.items()}
+    
+    assignments = ", ".join(f"{column}=?" for column in redacted_values)
+    conn.execute(f"UPDATE runs SET {assignments} WHERE id=?", [*redacted_values.values(), run_id])
 
 
 def _validate_table_columns(table: str, columns: Iterable[str]) -> None:
@@ -353,6 +457,13 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         statement = statement.strip()
         if statement:
             conn.execute(statement)
+            
+    # Idempotent schema migrations: check for failure_clusters column provider_extensions
+    cursor = conn.execute("PRAGMA table_info(failure_clusters)")
+    columns = [row["name"] for row in cursor.fetchall()]
+    if columns and "provider_extensions" not in columns:
+        conn.execute("ALTER TABLE failure_clusters ADD COLUMN provider_extensions TEXT;")
+
 
 
 def one(conn: sqlite3.Connection, sql: str, args: Iterable[Any] = ()) -> sqlite3.Row | None:
