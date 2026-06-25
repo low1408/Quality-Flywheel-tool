@@ -22,6 +22,20 @@ The central unit is not merely a prompt. It is a complete **run record**:
 
 OpenAI’s current Codex CLI supports non-interactive runs with JSONL output containing thread, turn, command, file-change, tool, error, and token-usage events. That makes `codex exec --json` the appropriate integration point for the first version. ([OpenAI Developers][1])
 
+The ingestion layer should be a **Local Agent Telemetry Collector**, not a frontend and not a text-stream interceptor. A frontend may be added later for review and dashboard workflows, but the durable foundation is provider-specific capture mechanisms feeding a local collector that validates, redacts, normalizes, correlates, and stores events.
+
+Keep two capture paths:
+
+```text
+Reproducible evaluation path:
+aq run → codex exec --json → collector → verifier/review/regressions
+
+Everyday usage path:
+provider lifecycle hooks → thin adapter → collector → monitoring/review
+```
+
+The first path owns the run boundary and is best for benchmarks, regression replay, and experiments. The second path observes normal IDE or CLI usage with less workflow disruption. Do not scrape rendered IDE text streams; use documented lifecycle hooks, `codex exec --json`, the SDK, or the App Server depending on the integration depth required.
+
 ---
 
 ## 1. Product scope
@@ -58,33 +72,51 @@ Those can come later. The first useful product is a CLI wrapper, SQLite database
 # 2. Recommended architecture
 
 ```text
-┌─────────────────────────────────────────────────────┐
-│ User                                                │
-│                                                     │
-│ aq run "Fix the parser..."                          │
-│ or IDE command invoking aq                          │
-└──────────────────────────┬──────────────────────────┘
+┌───────────────────────────────────────────────────────────────┐
+│ Capture sources                                                │
+│                                                               │
+│ • aq run "Fix the parser..."                                  │
+│ • IDE command invoking aq                                      │
+│ • Codex lifecycle hooks                                        │
+│ • Later: Claude Code hooks, documented provider hooks, SDKs    │
+└──────────────┬───────────────────────────┬────────────────────┘
+               │                           │
+               ▼                           ▼
+┌──────────────────────────────┐  ┌──────────────────────────────┐
+│ Run Orchestrator             │  │ Thin Source Adapters          │
+│                              │  │                              │
+│ • Creates run/session IDs    │  │ • Identify provider/product  │
+│ • Captures Git/config state  │  │ • Attach adapter version     │
+│ • Starts Codex for evals     │  │ • Minimal emergency redaction│
+│ • Captures final diff        │  │ • Forward source payload     │
+└──────────────┬───────────────┘  └──────────────┬───────────────┘
+               │                                 │
+               └──────────────┬──────────────────┘
+                              ▼
+┌───────────────────────────────────────────────────────────────┐
+│ Local Agent Telemetry Collector                               │
+│                                                               │
+│ • Authenticates local writers                                 │
+│ • Validates event envelopes                                   │
+│ • Performs authoritative redaction before storage             │
+│ • Deduplicates and orders events                              │
+│ • Normalizes into canonical event types                       │
+│ • Preserves sanitized provider extensions                     │
+│ • Correlates sessions, turns, tools, files, artifacts          │
+│ • Buffers durably when exporters are unavailable              │
+└──────────────────────────┬────────────────────────────────────┘
                            │
                            ▼
 ┌─────────────────────────────────────────────────────┐
-│ Run Orchestrator                                    │
+│ Event Store and Artifacts                           │
 │                                                     │
-│ • Creates run ID                                    │
-│ • Captures Git/config state                         │
-│ • Starts Codex                                      │
-│ • Streams and stores events                         │
-│ • Captures final diff                               │
-└───────────────┬──────────────────┬──────────────────┘
-                │                  │
-                ▼                  ▼
-┌───────────────────────┐  ┌──────────────────────────┐
-│ Codex Adapter         │  │ Event Normalizer         │
-│                       │  │                          │
-│ codex exec --json     │  │ JSONL → internal events │
-│ Later: SDK/App Server │  │ commands, edits, errors  │
-└───────────────────────┘  └─────────────┬────────────┘
-                                         │
-                                         ▼
+│ • SQLite event store                                │
+│ • Sanitized JSONL archives                          │
+│ • Patch, verifier, and environment artifacts        │
+│ • Optional OTLP or JSONL export                     │
+└──────────────────────────┬──────────────────────────┘
+                           │
+                           ▼
 ┌─────────────────────────────────────────────────────┐
 │ Verification Engine                                 │
 │                                                     │
@@ -123,7 +155,22 @@ Those can come later. The first useful product is a CLI wrapper, SQLite database
 
 # 3. Integration strategy
 
-## Version 1: Wrap `codex exec`
+## Version 1: Collector plus Codex-owned runs
+
+Version 1 should keep the implementation narrow:
+
+* Local Agent Telemetry Collector
+* `aq run` orchestrator
+* Codex adapter for `codex exec --json`
+* Optional Codex lifecycle-hook adapter for everyday usage
+* SQLite storage
+* Git diff and artifact capture
+* Verifier execution
+* Terminal review
+
+This gives both reproducible evaluation and a path toward observing normal IDE or CLI usage without intercepting rendered text streams.
+
+### Reproducible path: wrap `codex exec`
 
 Use a command such as:
 
@@ -146,7 +193,7 @@ codex exec \
 
 Codex’s non-interactive mode emits machine-readable JSONL events and supports explicit sandbox settings. The default sandbox is read-only, so the wrapper should explicitly request workspace write access only for runs that need edits. ([OpenAI Developers][1])
 
-### Why this is the correct first integration
+This path is still the best first integration for benchmarks and regression runs because it owns the run boundary, repository state, verifier config, and final diff.
 
 It gives you:
 
@@ -162,6 +209,28 @@ It gives you:
 It also allows users to continue reviewing changes in their normal IDE.
 
 The Codex CLI and IDE extension share configuration layers, including user and project configuration, models, approval settings, sandbox settings, and MCP configuration. This means wrapper-based runs can broadly follow the same project configuration as IDE sessions. ([OpenAI Developers][2])
+
+### Everyday usage path: provider lifecycle hooks
+
+For normal development usage, provider lifecycle hooks should send events into the same collector.
+
+Codex lifecycle hooks can observe session, prompt, tool, and stop events. A small adapter executable should read the hook payload from stdin, attach source metadata, perform only emergency high-confidence redaction, and send it to the local collector. ([OpenAI Developers][6])
+
+Claude Code can be added later through its documented hook system, including HTTP hook handlers. ([Anthropic Docs][7])
+
+Do not make hooks the only ingestion path. Hooks are good for monitoring everyday usage, but `aq run` is better for reproducible evaluations because it controls isolation, verifier execution, and artifact capture.
+
+### Collector transport
+
+Use one logical ingestion API, but allow multiple physical transports:
+
+```text
+macOS/Linux     Unix domain socket
+Windows         Named pipe
+Fallback        Loopback HTTP
+```
+
+Loopback HTTP is convenient for early development and for providers that can call HTTP hooks directly, but "bound to localhost" is not enough authentication. Use Unix-socket permissions, named-pipe ACLs, or an installation-specific bearer credential. The ingestion contract should include bounded request sizes, short timeouts, idempotency keys, schema versioning, adapter versioning, and non-blocking failure behavior.
 
 ## Version 2: Codex SDK
 
@@ -191,6 +260,32 @@ Use Codex App Server only when you want a deeply integrated client:
 
 The App Server is the same class of interface used to power rich clients such as the Codex VS Code extension. It exposes threads, turns, items, commands, file changes, and streamed notifications through JSON-RPC. ([OpenAI Developers][4])
 
+## Provider roadmap
+
+| Provider            | Preferred integration               | Adapter behavior                                      |
+| ------------------- | ----------------------------------- | ----------------------------------------------------- |
+| Codex               | `aq run`, `codex exec --json`, hooks | Send source events and orchestrated run metadata      |
+| Claude Code         | Official hooks                       | Post hook context to the collector                    |
+| Antigravity IDE/CLI | Documented hooks or plugin packaging when available | Send documented hook events and artifact references   |
+| SDK-created agents  | SDK lifecycle hooks                  | Emit events directly with explicit capabilities       |
+| Unknown provider    | CLI wrapper or IDE extension         | Best-effort capture with declared coverage limits     |
+
+Each adapter should publish capture capabilities so reports do not compare providers as if they expose identical telemetry:
+
+```json
+{
+  "capabilities": {
+    "prompt_submitted": true,
+    "assistant_output": true,
+    "tool_started": false,
+    "tool_completed": true,
+    "file_mutations": true,
+    "artifact_events": false,
+    "token_usage": true
+  }
+}
+```
+
 ---
 
 # 4. Repository structure
@@ -207,13 +302,31 @@ agent-quality/
 │       ├── db.py
 │       ├── models.py
 │       ├── orchestrator.py
+│       ├── collector/
+│       │   ├── server.py
+│       │   ├── auth.py
+│       │   ├── envelope.py
+│       │   ├── spool.py
+│       │   └── transports.py
 │       ├── adapters/
 │       │   ├── base.py
-│       │   └── codex_cli.py
+│       │   ├── codex_cli.py
+│       │   ├── codex_hooks.py
+│       │   └── capability.py
 │       ├── capture/
 │       │   ├── git_state.py
-│       │   ├── event_parser.py
 │       │   └── artifacts.py
+│       ├── normalization/
+│       │   ├── events.py
+│       │   ├── codex.py
+│       │   └── taxonomy.py
+│       ├── privacy/
+│       │   ├── redaction.py
+│       │   ├── secrets.py
+│       │   └── policy.py
+│       ├── exporters/
+│       │   ├── jsonl.py
+│       │   └── otlp.py
 │       ├── verification/
 │       │   ├── runner.py
 │       │   ├── commands.py
@@ -259,6 +372,10 @@ project/
 # 5. Data model
 
 Do not store everything in one `runs` table. Separate observations, automated outcomes, and human judgments.
+
+Use a canonical core plus sanitized provider extensions. Provider-neutral does not mean provider-blind: dashboards should query common fields such as `event_type`, `tool_category`, `status`, and `duration_ms`, while diagnostics may inspect provider-specific extension fields that cannot be mapped without information loss.
+
+The collector must redact before database insertion, WAL activity, debug logging, or export. Do not store unredacted `raw_provider_data`.
 
 ## Sessions
 
@@ -321,27 +438,125 @@ CREATE TABLE runs (
 
 ## Events
 
-Store normalized events and preserve the original JSON.
+Store normalized events, source metadata, and sanitized provider payloads. Preserve enough sanitized source detail to reprocess old events through improved normalizers later.
 
 ```sql
 CREATE TABLE events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id TEXT NOT NULL,
-    sequence_number INTEGER NOT NULL,
+    id TEXT PRIMARY KEY,
+    schema_version TEXT NOT NULL,
 
     event_type TEXT NOT NULL,
-    item_type TEXT,
+    source_provider TEXT NOT NULL,
+    source_product TEXT,
+    source_event_type TEXT NOT NULL,
+    adapter_version TEXT NOT NULL,
+
+    session_id TEXT,
+    run_id TEXT,
+    turn_id TEXT,
+    parent_event_id TEXT,
+    sequence_number INTEGER,
+
+    occurred_at TEXT,
+    observed_at TEXT NOT NULL,
+
     status TEXT,
+    item_type TEXT,
+    tool_category TEXT,
 
     command TEXT,
     exit_code INTEGER,
     path TEXT,
+    duration_ms INTEGER,
 
     normalized_payload TEXT,
-    raw_payload TEXT NOT NULL,
-    occurred_at TEXT,
+    source_payload_sanitized TEXT NOT NULL,
+    provider_extensions TEXT,
+
+    privacy_status TEXT NOT NULL,
+    privacy_policy_version TEXT NOT NULL,
+    redaction_findings TEXT,
+    normalization_status TEXT NOT NULL,
+    idempotency_key TEXT,
 
     FOREIGN KEY(run_id) REFERENCES runs(id)
+);
+```
+
+The ingestion envelope should contain the same concepts before persistence:
+
+```json
+{
+  "schema_version": "1.0",
+  "event_id": "evt_01JZ...",
+  "event_type": "agent.tool.completed",
+  "occurred_at": "2026-06-25T11:48:00.123Z",
+  "observed_at": "2026-06-25T11:48:00.141Z",
+  "source": {
+    "provider": "openai",
+    "product": "codex",
+    "source_event_type": "PostToolUse",
+    "adapter_version": "0.1.0"
+  },
+  "correlation": {
+    "session_id": "ses_...",
+    "run_id": "run_...",
+    "turn_id": "turn_...",
+    "parent_event_id": "evt_...",
+    "sequence": 27
+  },
+  "workspace": {
+    "workspace_id": "wrk_hmac_...",
+    "repository_id": "repo_hmac_..."
+  },
+  "data": {
+    "tool_category": "file_edit",
+    "status": "success",
+    "duration_ms": 38
+  },
+  "extensions": {
+    "openai.codex": {
+      "source_tool_name": "apply_patch"
+    }
+  },
+  "privacy": {
+    "policy_version": "redaction-1.0",
+    "status": "sanitized",
+    "raw_payload_retained": false
+  }
+}
+```
+
+Thin adapters may perform emergency high-confidence redaction, but the collector owns authoritative redaction, canonical event taxonomy, deduplication, and correlation.
+
+## Artifacts and provider deliverables
+
+Do not collapse all provider-specific deliverables into turns. Some agents produce structured artifacts such as plans, diffs, architecture diagrams, walkthroughs, or reviewable documents. Model these explicitly when a provider exposes them.
+
+```sql
+CREATE TABLE provider_artifacts (
+    id TEXT PRIMARY KEY,
+    session_id TEXT,
+    run_id TEXT,
+    created_by_turn_id TEXT,
+    source_provider TEXT NOT NULL,
+    artifact_type TEXT NOT NULL,
+    title TEXT,
+    approval_status TEXT,
+    current_revision_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT
+);
+
+CREATE TABLE provider_artifact_revisions (
+    id TEXT PRIMARY KEY,
+    artifact_id TEXT NOT NULL,
+    created_by_event_id TEXT,
+    revision_number INTEGER NOT NULL,
+    payload_sanitized TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(artifact_id) REFERENCES provider_artifacts(id)
 );
 ```
 
@@ -1317,6 +1532,9 @@ Implement:
 * No automatic cloud upload
 * No storage of authentication files
 * Network-disabled evaluation environments where possible
+* Local writer authentication for collector ingestion
+* Sanitized source-payload archives only
+* Redaction status and policy version on every event
 
 Do not capture all environment variables. Record an allowlisted manifest such as runtime versions and dependency hashes.
 
@@ -1373,10 +1591,16 @@ aq report cost
 
 # 23. Implementation sequence
 
-## Stage 1 — Instrumented wrapper
+## Stage 1 — Local collector and instrumented Codex path
 
 Deliver:
 
+* Local Agent Telemetry Collector
+* One ingestion transport, preferably loopback HTTP for the prototype
+* Local writer authentication
+* Versioned event envelope
+* Central redaction before persistence
+* Canonical event normalization
 * `aq run`
 * Codex JSONL capture
 * Git state capture
@@ -1391,12 +1615,34 @@ Exit criteria:
 ```text
 At least 20 real tasks captured
 All events linked to runs
+All persisted source payloads sanitized
+Every event has schema, source, adapter, privacy, and correlation metadata
 Diffs and verifier logs reproducible
 Human labels stored separately from automatic outcomes
 No lost or corrupted run records
 ```
 
-## Stage 2 — Reliable verification
+## Stage 2 — Codex hooks for everyday monitoring
+
+Add:
+
+* Codex lifecycle-hook adapter
+* Durable local spool when the collector is unavailable
+* Idempotency and duplicate suppression
+* Adapter capability declaration
+* Session/turn reconciliation for hook-originated events
+* Monitoring signals for rejected, reverted, or manually rewritten patches
+
+Exit criteria:
+
+```text
+Normal Codex usage can be observed without scraping IDE text
+Hook failures do not block agent usage
+Adapter capabilities are stored with every captured source
+Hook-originated events can be linked to later human review signals
+```
+
+## Stage 3 — Reliable verification
 
 Add:
 
@@ -1417,7 +1663,7 @@ Agent claims are cross-checked against observed commands
 Verifier failures are distinguished from infrastructure failures
 ```
 
-## Stage 3 — Regression registry
+## Stage 4 — Regression registry
 
 Add:
 
@@ -1437,7 +1683,7 @@ Cases run from clean base commits
 Results are reproducible
 ```
 
-## Stage 4 — Failure diagnosis
+## Stage 5 — Failure diagnosis
 
 Add:
 
@@ -1456,7 +1702,7 @@ Every high-severity failure has an owner or disposition
 Low-confidence diagnoses remain explicitly uncertain
 ```
 
-## Stage 5 — Experimentation
+## Stage 6 — Experimentation
 
 Add:
 
@@ -1475,7 +1721,7 @@ Target-cluster improvement is measured separately
 Critical regressions block release
 ```
 
-## Stage 6 — IDE integration
+## Stage 7 — Multi-provider and IDE integration
 
 Add:
 
@@ -1485,6 +1731,8 @@ Add:
 * Trace timeline
 * Cluster links
 * “Promote to regression” button
+* Claude Code hook adapter
+* Additional provider adapters with explicit capability coverage
 
 Use the Codex SDK or App Server at this stage rather than attempting to reverse-engineer the existing IDE interface. The SDK is suited to programmatic internal workflows, while App Server is intended for rich client integration. ([OpenAI Developers][4])
 
@@ -1503,6 +1751,7 @@ For a local first implementation:
 | Migrations           | Alembic                           |
 | Configuration        | YAML                              |
 | Process execution    | `asyncio.create_subprocess_exec`  |
+| Local ingestion      | Loopback HTTP first; Unix sockets or named pipes later |
 | Dashboard            | Streamlit initially               |
 | Statistical analysis | pandas/scipy                      |
 | Worktree isolation   | Git worktrees                     |
@@ -1520,16 +1769,17 @@ The MVP is complete when you can demonstrate this loop:
 
 ```text
 1. Run a real Codex task through the wrapper.
-2. Capture its prompt, configuration, trajectory, diff, and tokens.
-3. Independently run acceptance and regression checks.
-4. Record a human acceptance decision.
-5. Diagnose a failed run and mark its critical event.
-6. Promote that run into a reproducible regression case.
-7. Add neighboring variants and a known-bad patch.
-8. Change one harness component.
-9. Compare baseline and candidate versions.
-10. Reject or promote the change using explicit release gates.
-11. Detect whether that failure recurs in later normal usage.
+2. Ingest events through the local collector.
+3. Capture its prompt, configuration, trajectory, diff, and tokens.
+4. Independently run acceptance and regression checks.
+5. Record a human acceptance decision.
+6. Diagnose a failed run and mark its critical event.
+7. Promote that run into a reproducible regression case.
+8. Add neighboring variants and a known-bad patch.
+9. Change one harness component.
+10. Compare baseline and candidate versions.
+11. Reject or promote the change using explicit release gates.
+12. Detect whether that failure recurs in later normal usage.
 ```
 
 That is the smallest implementation that genuinely constitutes a quality flywheel rather than a prompt logger.
@@ -1537,14 +1787,16 @@ That is the smallest implementation that genuinely constitutes a quality flywhee
 The immediate build order should therefore be:
 
 ```text
-Codex wrapper
-→ structured run database
+local telemetry collector
+→ Codex aq-run path
+→ structured event/run database
 → independent verifier
 → human review
 → regression registry
+→ Codex hook monitoring
 → failure clustering
 → harness experiments
-→ IDE integration
+→ multi-provider and IDE integration
 ```
 
 The most common mistake would be starting with the dashboard or automated clustering. The highest-value foundation is reproducible evidence: clean repository state, structured trajectories, independent verification, and consistent human outcomes.
@@ -1554,3 +1806,5 @@ The most common mistake would be starting with the dashboard or automated cluste
 [3]: https://developers.openai.com/codex/sdk?utm_source=chatgpt.com "Codex SDK"
 [4]: https://developers.openai.com/codex/app-server?utm_source=chatgpt.com "Codex App Server"
 [5]: https://developers.openai.com/cookbook/examples/agents_sdk/agent_improvement_loop?utm_source=chatgpt.com "Build an Agent Improvement Loop with Traces, Evals, and ..."
+[6]: https://developers.openai.com/codex/hooks "Hooks – Codex"
+[7]: https://docs.anthropic.com/en/docs/claude-code/hooks "Hooks reference - Claude Code Docs"
