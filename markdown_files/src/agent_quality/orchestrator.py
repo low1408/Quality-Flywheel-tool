@@ -28,6 +28,7 @@ def run_task(
     allow_dirty: bool = False,
     model: str | None = None,
     agent_command: list[str] | None = None,
+    agent_timeout_seconds: int = 600,
 ) -> str:
     repo = repo_root(repo)
     before_status = status_porcelain(repo)
@@ -36,112 +37,180 @@ def run_task(
 
     conn = connect()
     run_id = new_id("run")
+    auto_session = session_id is None
     session_id = session_id or new_id("ses")
     started_at = utc_now()
     base_commit = head_commit(repo)
     verify_config = load_verify_config(verify_path)
     prompt_hash = sha256_text(prompt)
     begin = time.monotonic()
-
-    with conn:
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO sessions (
-                id, repository_path, repository_remote_hash, started_at, ended_at, final_outcome, task_summary
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (session_id, str(repo), None, started_at, None, None, prompt[:240]),
-        )
-        insert(
-            conn,
-            "runs",
-            {
-                "id": run_id,
-                "session_id": session_id,
-                "turn_number": 1,
-                "prompt": prompt,
-                "prompt_hash": prompt_hash,
-                "repository_path": str(repo),
-                "base_commit": base_commit,
-                "resulting_commit": None,
-                "model": model,
-                "agent_adapter": "codex-cli",
-                "agent_version": _codex_version(),
-                "wrapper_version": __version__,
-                "codex_config_hash": file_hash_if_exists(repo, ".codex/config.toml"),
-                "agents_md_hash": file_hash_if_exists(repo, "AGENTS.md"),
-                "verifier_version": sha256_text(json.dumps(verify_config, sort_keys=True)),
-                "started_at": started_at,
-                "completed_at": None,
-                "duration_ms": None,
-                "agent_status": "created",
-                "verifier_status": None,
-                "human_status": "not_reviewed",
-                "lifecycle_status": "still_open",
-                "input_tokens": None,
-                "cached_input_tokens": None,
-                "output_tokens": None,
-            },
-        )
-        _store_artifact(conn, run_id, "prompt", "prompt.txt", prompt)
-        _store_artifact(conn, run_id, "before_status", "before-status.txt", before_status)
-
     command = agent_command or ["codex", "exec", "--json", "--sandbox", "workspace-write", prompt]
     if model and not agent_command:
         command = ["codex", "exec", "--json", "--model", model, "--sandbox", "workspace-write", prompt]
+    agent_adapter = _agent_adapter(command)
+    agent_status = "created"
+    verifier_status = None
+    run_inserted = False
+    finalized = False
 
-    with conn:
-        update_run(conn, run_id, agent_status="running")
-
-    stdout = ""
-    stderr = ""
-    exit_code = 127
     try:
-        proc = subprocess.run(command, cwd=repo, text=True, capture_output=True)
-        stdout, stderr, exit_code = proc.stdout, proc.stderr, proc.returncode
-    except FileNotFoundError as exc:
-        stderr = str(exc)
-
-    raw_lines = stdout.splitlines()
-    rows = rows_from_jsonl(raw_lines, run_id=run_id, session_id=session_id)
-    with conn:
-        for row in rows:
-            insert(conn, "events", row)
-        _store_artifact(conn, run_id, "events_jsonl", "events.jsonl", stdout)
-        _store_artifact(conn, run_id, "stderr", "stderr.txt", stderr)
-
-    after_status = status_porcelain(repo)
-    final_patch = diff(repo, "--binary")
-    name_status = diff(repo, "--name-status")
-    with conn:
-        _store_artifact(conn, run_id, "after_status", "after-status.txt", after_status)
-        _store_artifact(conn, run_id, "final_patch", "final.patch", final_patch)
-        _store_artifact(conn, run_id, "environment_manifest", "environment.json", _environment_manifest(repo, command))
-
-    verifier = run_verifiers(conn, run_id=run_id, repo=repo, config=verify_config)
-    violations = protected_violations(changed_paths_from_name_status(name_status), protected_patterns(verify_config))
-    verifier_status = "failed" if violations else verifier.status
-    if violations:
         with conn:
-            _store_artifact(conn, run_id, "verifier_log", "protected-paths.txt", "\n".join(violations) + "\n")
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO sessions (
+                    id, repository_path, repository_remote_hash, started_at, ended_at, final_outcome, task_summary
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (session_id, str(repo), None, started_at, None, None, prompt[:240]),
+            )
+            turn_number = (
+                conn.execute("SELECT COALESCE(MAX(turn_number), 0) + 1 AS n FROM runs WHERE session_id=?", [session_id])
+                .fetchone()["n"]
+            )
+            insert(
+                conn,
+                "runs",
+                {
+                    "id": run_id,
+                    "session_id": session_id,
+                    "turn_number": turn_number,
+                    "prompt": prompt,
+                    "prompt_hash": prompt_hash,
+                    "repository_path": str(repo),
+                    "base_commit": base_commit,
+                    "resulting_commit": None,
+                    "model": model,
+                    "agent_adapter": agent_adapter,
+                    "agent_version": _codex_version() if agent_adapter == "codex-cli" else None,
+                    "wrapper_version": __version__,
+                    "codex_config_hash": file_hash_if_exists(repo, ".codex/config.toml"),
+                    "agents_md_hash": file_hash_if_exists(repo, "AGENTS.md"),
+                    "verifier_version": sha256_text(json.dumps(verify_config, sort_keys=True)),
+                    "started_at": started_at,
+                    "completed_at": None,
+                    "duration_ms": None,
+                    "agent_status": agent_status,
+                    "verifier_status": None,
+                    "human_status": "not_reviewed",
+                    "lifecycle_status": "still_open",
+                    "input_tokens": None,
+                    "cached_input_tokens": None,
+                    "output_tokens": None,
+                },
+            )
+            run_inserted = True
 
-    input_tokens, cached_input_tokens, output_tokens = extract_usage(raw_lines)
-    duration_ms = int((time.monotonic() - begin) * 1000)
-    with conn:
-        update_run(
-            conn,
-            run_id,
-            completed_at=utc_now(),
-            duration_ms=duration_ms,
-            agent_status="completed" if exit_code == 0 else "failed",
-            verifier_status=verifier_status,
-            input_tokens=input_tokens,
-            cached_input_tokens=cached_input_tokens,
-            output_tokens=output_tokens,
-        )
-        mark_session_ended(conn, session_id)
+        with conn:
+            _store_artifact(conn, run_id, "prompt", "prompt.txt", prompt)
+            _store_artifact(conn, run_id, "before_status", "before-status.txt", before_status)
+
+        with conn:
+            agent_status = "running"
+            update_run(conn, run_id, agent_status=agent_status)
+
+        stdout = ""
+        stderr = ""
+        exit_code = 127
+        try:
+            proc = subprocess.run(
+                command,
+                cwd=repo,
+                text=True,
+                capture_output=True,
+                timeout=agent_timeout_seconds,
+            )
+            stdout, stderr, exit_code = proc.stdout, proc.stderr, proc.returncode
+            agent_status = "completed" if exit_code == 0 else "failed"
+        except subprocess.TimeoutExpired as exc:
+            stdout = _output_text(exc.stdout)
+            stderr = _output_text(exc.stderr)
+            if stderr:
+                stderr += "\n"
+            stderr += f"[agent-quality] agent command timed out after {agent_timeout_seconds} seconds"
+            exit_code = 124
+            agent_status = "timed_out"
+        except FileNotFoundError as exc:
+            stderr = str(exc)
+            agent_status = "failed"
+
+        raw_lines = stdout.splitlines()
+        rows = rows_from_jsonl(raw_lines, run_id=run_id, session_id=session_id)
+        with conn:
+            for row in rows:
+                insert(conn, "events", row)
+            _store_artifact(conn, run_id, "events_jsonl", "events.jsonl", stdout)
+            _store_artifact(conn, run_id, "stderr", "stderr.txt", stderr)
+
+        after_status = status_porcelain(repo)
+        final_patch = diff(repo, "--binary")
+        name_status = diff(repo, "--name-status")
+        with conn:
+            _store_artifact(conn, run_id, "after_status", "after-status.txt", after_status)
+            _store_artifact(conn, run_id, "final_patch", "final.patch", final_patch)
+            _store_artifact(conn, run_id, "environment_manifest", "environment.json", _environment_manifest(repo, command))
+
+        verifier = run_verifiers(conn, run_id=run_id, repo=repo, config=verify_config)
+        violations = protected_violations(changed_paths_from_name_status(name_status), protected_patterns(verify_config))
+        verifier_status = "failed" if violations else verifier.status
+        if violations:
+            with conn:
+                _store_artifact(conn, run_id, "verifier_log", "protected-paths.txt", "\n".join(violations) + "\n")
+                insert(
+                    conn,
+                    "verifier_results",
+                    {
+                        "id": new_id("ver"),
+                        "run_id": run_id,
+                        "verifier_name": "protected-paths",
+                        "verifier_category": "protected_path",
+                        "command": None,
+                        "started_at": utc_now(),
+                        "duration_ms": 0,
+                        "exit_code": 1,
+                        "passed": 0,
+                        "stdout_path": None,
+                        "stderr_path": None,
+                    },
+                )
+
+        input_tokens, cached_input_tokens, output_tokens = extract_usage(raw_lines)
+        duration_ms = int((time.monotonic() - begin) * 1000)
+        with conn:
+            update_run(
+                conn,
+                run_id,
+                completed_at=utc_now(),
+                duration_ms=duration_ms,
+                agent_status=agent_status,
+                verifier_status=verifier_status,
+                lifecycle_status="closed",
+                resulting_commit=head_commit(repo),
+                input_tokens=input_tokens,
+                cached_input_tokens=cached_input_tokens,
+                output_tokens=output_tokens,
+            )
+            if auto_session:
+                mark_session_ended(conn, session_id)
+        finalized = True
+    except Exception:
+        if run_inserted and not finalized:
+            duration_ms = int((time.monotonic() - begin) * 1000)
+            with conn:
+                update_run(
+                    conn,
+                    run_id,
+                    completed_at=utc_now(),
+                    duration_ms=duration_ms,
+                    agent_status="failed",
+                    verifier_status=verifier_status,
+                    lifecycle_status="closed",
+                    resulting_commit=head_commit(repo),
+                )
+                if auto_session:
+                    mark_session_ended(conn, session_id, outcome="failed")
+        raise
     print(f"run_id={run_id}")
-    print(f"agent_status={'completed' if exit_code == 0 else 'failed'} verifier_status={verifier_status}")
+    print(f"agent_status={agent_status} verifier_status={verifier_status}")
     return run_id
 
 
@@ -166,6 +235,21 @@ def _codex_version() -> str | None:
         return None
     proc = subprocess.run(["codex", "--version"], text=True, capture_output=True)
     return (proc.stdout or proc.stderr).strip() or None
+
+
+def _agent_adapter(command: list[str]) -> str:
+    if not command:
+        return "unknown"
+    executable = Path(command[0]).name
+    return "codex-cli" if executable == "codex" else executable
+
+
+def _output_text(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
 
 
 def _environment_manifest(repo: Path, command: list[str]) -> str:

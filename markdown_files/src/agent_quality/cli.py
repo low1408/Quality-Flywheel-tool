@@ -29,6 +29,7 @@ def main(argv: list[str] | None = None) -> None:
     run.add_argument("--session")
     run.add_argument("--allow-dirty", action="store_true")
     run.add_argument("--model")
+    run.add_argument("--agent-timeout-seconds", type=int, default=600)
     run.add_argument("--agent-command", nargs=argparse.REMAINDER)
 
     ingest = sub.add_parser("ingest")
@@ -71,6 +72,7 @@ def main(argv: list[str] | None = None) -> None:
             allow_dirty=args.allow_dirty,
             model=args.model,
             agent_command=args.agent_command or None,
+            agent_timeout_seconds=args.agent_timeout_seconds,
         )
     elif args.command == "ingest":
         _ingest(args.file)
