@@ -265,7 +265,7 @@
     }
     const details = state.details;
     if (!details || !details.run) {
-      elements.detailPane.innerHTML = '<div class="empty-state"><h2>No run selected</h2><p>Select a run from the list.</p></div>';
+      elements.detailPane.innerHTML = '<div class="empty-state"><h2>No run selected</h2><p>No active selection.</p></div>';
       return;
     }
     const run = details.run;

@@ -9,10 +9,8 @@ let output;
 let statusItem;
 let collectorProcess;
 let runsProvider;
-let extensionContext;
 
 function activate(context) {
-  extensionContext = context;
   output = vscode.window.createOutputChannel("Agent Quality");
   statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
   statusItem.text = "$(pulse) Agent Quality";
@@ -192,28 +190,12 @@ async function reportSummary() {
   runsProvider.refresh();
 }
 
-async function runIdCommand(subcommand, item) {
-  const folder = await pickWorkspaceFolder();
-  if (!folder) {
-    return;
-  }
-  const runId = await resolveRunId(item);
-  if (!runId) {
-    return;
-  }
-  await runAq([subcommand, runId], folder, { title: `${subcommand} ${runId}`, reveal: true });
-}
-
 async function showDashboardRun(context, item, tab) {
   const runId = await resolveRunId(item);
   if (!runId) {
     return;
   }
   DashboardPanel.show(context, runId, tab);
-}
-
-async function reviewRun(item) {
-  await showDashboardRun(extensionContext, item, "review");
 }
 
 async function runAq(args, folder, options) {
