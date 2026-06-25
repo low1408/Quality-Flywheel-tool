@@ -1,0 +1,13 @@
+version: 1
+
+acceptance:
+  - name: package-tests
+    command: python3 -m pytest -q
+    timeout_seconds: 120
+
+protected_paths:
+  - .agent-quality/**
+
+trajectory:
+  require_test_after_final_edit: true
+  max_identical_failed_commands: 1
