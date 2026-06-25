@@ -45,7 +45,9 @@ def map_raw_event(raw: dict[str, Any], *, run_id: str, session_id: str | None, s
     kind = event_kind(raw)
     command = extract_command(raw)
     status = raw.get("status")
-    exit_code = raw.get("exit_code") or raw.get("code")
+    exit_code = raw.get("exit_code")
+    if exit_code is None:
+        exit_code = raw.get("code")
     path = raw.get("path") or raw.get("file")
     duration_ms = raw.get("duration_ms")
 

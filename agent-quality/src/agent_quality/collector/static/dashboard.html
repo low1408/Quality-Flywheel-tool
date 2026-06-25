@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Agent Quality Dashboard</title>
+    <link rel="stylesheet" href="./dashboard.css">
+    <script src="./dashboard.js" defer></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <div class="brand-copy">
+            <h1>Agent Quality</h1>
+            <p id="hostLabel">Dashboard</p>
+          </div>
+        </div>
+        <div class="top-actions">
+          <span id="syncState" class="sync-state">Idle</span>
+          <button type="button" class="button ghost" data-action="refresh" title="Refresh runs">Refresh</button>
+        </div>
+      </header>
+
+      <main class="workspace">
+        <aside class="run-rail" aria-label="Runs">
+          <div class="rail-head">
+            <div>
+              <h2>Runs</h2>
+              <p id="runCount">0</p>
+            </div>
+          </div>
+          <div class="rail-controls">
+            <input id="runSearch" type="search" autocomplete="off" placeholder="Search">
+            <select id="statusFilter" aria-label="Status filter">
+              <option value="all">All statuses</option>
+              <option value="passed">Verifier passed</option>
+              <option value="failed">Verifier failed</option>
+              <option value="reviewed">Reviewed</option>
+              <option value="unreviewed">Unreviewed</option>
+            </select>
+          </div>
+          <div id="runList" class="run-list"></div>
+        </aside>
+
+        <section id="detailPane" class="detail-pane" aria-live="polite">
+          <div class="empty-state">
+            <h2>No run selected</h2>
+            <p>Select a run from the list.</p>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <div id="modalBackdrop" class="modal-backdrop" hidden>
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+        <div class="modal-head">
+          <h2 id="modalTitle">File Preview</h2>
+          <button type="button" class="icon-button" data-action="closeModal" title="Close">x</button>
+        </div>
+        <pre id="modalContent" class="file-preview"></pre>
+      </div>
+    </div>
+  </body>
+</html>

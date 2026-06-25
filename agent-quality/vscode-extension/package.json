@@ -1,0 +1,216 @@
+{
+  "name": "agent-quality-vscode",
+  "displayName": "Agent Quality",
+  "description": "VS Code commands and views for the Agent Quality local sidecar.",
+  "version": "0.1.0",
+  "publisher": "agent-quality",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/low1408/Quality-Flywheel-tool.git"
+  },
+  "scripts": {
+    "check": "node --check src/extension.js",
+    "validate-package": "node -e \"JSON.parse(require('fs').readFileSync('package.json', 'utf8'))\""
+  },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onView:agentQuality.runs",
+    "onCommand:agentQuality.initProject",
+    "onCommand:agentQuality.runPrompt",
+    "onCommand:agentQuality.runSelection",
+    "onCommand:agentQuality.installCodexHooks",
+    "onCommand:agentQuality.startCollector",
+    "onCommand:agentQuality.stopCollector",
+    "onCommand:agentQuality.reportSummary",
+    "onCommand:agentQuality.refreshRuns",
+    "onCommand:agentQuality.showDashboard",
+    "onCommand:agentQuality.showRun",
+    "onCommand:agentQuality.diffRun",
+    "onCommand:agentQuality.traceRun",
+    "onCommand:agentQuality.reviewRun"
+  ],
+  "main": "./src/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "agentQuality",
+          "title": "Agent Quality",
+          "icon": "media/activity.svg"
+        }
+      ]
+    },
+    "views": {
+      "agentQuality": [
+        {
+          "id": "agentQuality.runs",
+          "name": "Runs"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "agentQuality.initProject",
+        "title": "Agent Quality: Initialize Project"
+      },
+      {
+        "command": "agentQuality.runPrompt",
+        "title": "Agent Quality: Run Prompt"
+      },
+      {
+        "command": "agentQuality.runSelection",
+        "title": "Agent Quality: Run Selection"
+      },
+      {
+        "command": "agentQuality.installCodexHooks",
+        "title": "Agent Quality: Install Codex Hooks"
+      },
+      {
+        "command": "agentQuality.startCollector",
+        "title": "Agent Quality: Start Collector"
+      },
+      {
+        "command": "agentQuality.stopCollector",
+        "title": "Agent Quality: Stop Collector"
+      },
+      {
+        "command": "agentQuality.reportSummary",
+        "title": "Agent Quality: Show Summary"
+      },
+      {
+        "command": "agentQuality.refreshRuns",
+        "title": "Agent Quality: Refresh Runs",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "agentQuality.showDashboard",
+        "title": "Agent Quality: Open Dashboard",
+        "icon": "$(dashboard)"
+      },
+      {
+        "command": "agentQuality.showRun",
+        "title": "Agent Quality: Show Run",
+        "icon": "$(eye)"
+      },
+      {
+        "command": "agentQuality.diffRun",
+        "title": "Agent Quality: Show Run Diff",
+        "icon": "$(diff)"
+      },
+      {
+        "command": "agentQuality.traceRun",
+        "title": "Agent Quality: Show Run Trace",
+        "icon": "$(list-tree)"
+      },
+      {
+        "command": "agentQuality.reviewRun",
+        "title": "Agent Quality: Review Run",
+        "icon": "$(comment-discussion)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "agentQuality.showDashboard",
+          "when": "view == agentQuality.runs",
+          "group": "navigation@1"
+        },
+        {
+          "command": "agentQuality.refreshRuns",
+          "when": "view == agentQuality.runs",
+          "group": "navigation@2"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "agentQuality.showRun",
+          "when": "view == agentQuality.runs && viewItem == run",
+          "group": "inline@1"
+        },
+        {
+          "command": "agentQuality.diffRun",
+          "when": "view == agentQuality.runs && viewItem == run",
+          "group": "inline@2"
+        },
+        {
+          "command": "agentQuality.traceRun",
+          "when": "view == agentQuality.runs && viewItem == run",
+          "group": "inline@3"
+        },
+        {
+          "command": "agentQuality.reviewRun",
+          "when": "view == agentQuality.runs && viewItem == run",
+          "group": "navigation"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "agentQuality.runSelection",
+          "when": "editorHasSelection",
+          "group": "agentQuality"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Agent Quality",
+      "properties": {
+        "agentQuality.aqCommand": {
+          "type": "string",
+          "default": "aq",
+          "description": "Command used to run the Agent Quality CLI. This may be an executable such as aq or a command line such as python3 -m agent_quality.cli."
+        },
+        "agentQuality.cliSourceRoot": {
+          "type": "string",
+          "default": "",
+          "description": "Optional checkout path containing src/agent_quality. When set, the extension adds <path>/src to PYTHONPATH for aq commands."
+        },
+        "agentQuality.pythonPath": {
+          "type": "string",
+          "default": "python3",
+          "description": "Python executable passed to aq install-codex-hooks."
+        },
+        "agentQuality.home": {
+          "type": "string",
+          "default": "",
+          "description": "AGENT_QUALITY_HOME for VS Code commands. Defaults to .agent-quality/local in the workspace."
+        },
+        "agentQuality.verifyPath": {
+          "type": "string",
+          "default": "",
+          "description": "Verifier config path. Defaults to .agent-quality/verify.yaml in the workspace when it exists."
+        },
+        "agentQuality.allowDirtyRuns": {
+          "type": "boolean",
+          "default": false,
+          "description": "Pass --allow-dirty to aq run."
+        },
+        "agentQuality.model": {
+          "type": "string",
+          "default": "",
+          "description": "Optional model passed to aq run."
+        },
+        "agentQuality.collectorHost": {
+          "type": "string",
+          "default": "127.0.0.1",
+          "description": "Host for aq serve-collector."
+        },
+        "agentQuality.collectorPort": {
+          "type": "number",
+          "default": 8765,
+          "description": "Port for aq serve-collector."
+        },
+        "agentQuality.collectorToken": {
+          "type": "string",
+          "default": "",
+          "description": "Optional bearer token for aq serve-collector."
+        }
+      }
+    }
+  }
+}

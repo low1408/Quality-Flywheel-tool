@@ -8,7 +8,10 @@ def summary() -> None:
     total = one(conn, "SELECT COUNT(*) AS n FROM runs")["n"]
     completed = one(conn, "SELECT COUNT(*) AS n FROM runs WHERE agent_status='completed'")["n"]
     verifier_passed = one(conn, "SELECT COUNT(*) AS n FROM runs WHERE verifier_status='passed'")["n"]
-    reviewed = one(conn, "SELECT COUNT(*) AS n FROM runs WHERE human_status IS NOT NULL AND human_status!='not_reviewed'")["n"]
+    reviewed = one(
+        conn,
+        "SELECT COUNT(*) AS n FROM runs WHERE human_status IS NOT NULL AND human_status NOT IN ('not_reviewed','review_skipped')",
+    )["n"]
     accepted = one(
         conn,
         "SELECT COUNT(*) AS n FROM runs WHERE human_status IN ('accepted_cleanly','accepted_with_minor_edits','accepted_with_major_edits')",

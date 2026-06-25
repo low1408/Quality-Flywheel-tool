@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import sqlite3
 import sys
 from pathlib import Path
 
+from agent_quality.adapters.codex_hooks import main as codex_hook_main
 from agent_quality.collector.envelope import normalize_envelope
 from agent_quality.collector.server import serve
 from agent_quality.db import all_rows, connect, insert, one
@@ -29,11 +31,21 @@ def main(argv: list[str] | None = None) -> None:
     run.add_argument("--session")
     run.add_argument("--allow-dirty", action="store_true")
     run.add_argument("--model")
+    run.add_argument("--skip-review", action="store_true", help="record the run but exclude it from human review queues")
     run.add_argument("--agent-timeout-seconds", type=int, default=600)
     run.add_argument("--agent-command", nargs=argparse.REMAINDER)
 
     ingest = sub.add_parser("ingest")
     ingest.add_argument("--file")
+
+    hook = sub.add_parser("hook")
+    hook_sub = hook.add_subparsers(dest="hook", required=True)
+    codex_hook = hook_sub.add_parser("codex")
+    codex_hook.add_argument("event")
+
+    install_hooks = sub.add_parser("install-codex-hooks")
+    install_hooks.add_argument("--repo", default=".")
+    install_hooks.add_argument("--python", default=sys.executable)
 
     server = sub.add_parser("serve-collector")
     server.add_argument("--host", default="127.0.0.1")
@@ -72,10 +84,15 @@ def main(argv: list[str] | None = None) -> None:
             allow_dirty=args.allow_dirty,
             model=args.model,
             agent_command=args.agent_command or None,
+            skip_review=args.skip_review,
             agent_timeout_seconds=args.agent_timeout_seconds,
         )
     elif args.command == "ingest":
         _ingest(args.file)
+    elif args.command == "hook" and args.hook == "codex":
+        raise SystemExit(codex_hook_main([args.event]))
+    elif args.command == "install-codex-hooks":
+        _install_codex_hooks(Path(args.repo), args.python)
     elif args.command == "serve-collector":
         serve(args.host, args.port, token=args.token)
     elif args.command == "review":
@@ -122,6 +139,32 @@ def _init_project(repo: Path) -> None:
     if not config.exists():
         config.write_text("version: 1\n", encoding="utf-8")
     print(f"initialized {aq}")
+
+
+def _install_codex_hooks(repo: Path, python: str) -> None:
+    repo = repo.resolve()
+    codex_dir = repo / ".codex"
+    codex_dir.mkdir(parents=True, exist_ok=True)
+    aq_home = repo / ".agent-quality" / "local"
+    aq_home.mkdir(parents=True, exist_ok=True)
+    tool_src = Path(__file__).resolve().parents[1]
+    command = (
+        f"AGENT_QUALITY_HOME={shlex.quote(str(aq_home))} "
+        f"PYTHONPATH={shlex.quote(str(tool_src))} "
+        f"{shlex.quote(python)} -m agent_quality.cli hook codex"
+    )
+    hooks = {
+        "hooks": {
+            "SessionStart": [{"hooks": [{"type": "command", "command": f"{command} SessionStart"}]}],
+            "UserPromptSubmit": [{"hooks": [{"type": "command", "command": f"{command} UserPromptSubmit"}]}],
+            "PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": f"{command} PreToolUse"}]}],
+            "PostToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": f"{command} PostToolUse"}]}],
+            "PermissionRequest": [{"matcher": "*", "hooks": [{"type": "command", "command": f"{command} PermissionRequest"}]}],
+            "Stop": [{"hooks": [{"type": "command", "command": f"{command} Stop", "timeout": 30}]}],
+        }
+    }
+    (codex_dir / "hooks.json").write_text(json.dumps(hooks, indent=2) + "\n", encoding="utf-8")
+    print(f"installed Codex hooks: {codex_dir / 'hooks.json'}")
 
 
 def _ingest(path: str | None) -> None:

@@ -15,5 +15,8 @@ aq = "agent_quality.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"agent_quality" = ["collector/static/*.html", "collector/static/*.css", "collector/static/*.js"]
+
 [tool.pytest.ini_options]
 pythonpath = ["src"]

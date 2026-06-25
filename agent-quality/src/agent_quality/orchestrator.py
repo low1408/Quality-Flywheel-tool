@@ -28,6 +28,7 @@ def run_task(
     allow_dirty: bool = False,
     model: str | None = None,
     agent_command: list[str] | None = None,
+    skip_review: bool = False,
     agent_timeout_seconds: int = 600,
 ) -> str:
     repo = repo_root(repo)
@@ -91,7 +92,7 @@ def run_task(
                     "duration_ms": None,
                     "agent_status": agent_status,
                     "verifier_status": None,
-                    "human_status": "not_reviewed",
+                    "human_status": "review_skipped" if skip_review else "not_reviewed",
                     "lifecycle_status": "still_open",
                     "input_tokens": None,
                     "cached_input_tokens": None,
