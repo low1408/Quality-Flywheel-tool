@@ -2,7 +2,7 @@
 
 Local-first quality sidecar for coding-agent runs.
 
-This MVP implements the first foundation from `implementation_details/implemenation_details.md`:
+This MVP implements the first foundation from `implementation_details/implementation_details.md`:
 
 - `aq run` wraps `codex exec --json`, captures JSONL events, stores artifacts, and runs independent verifiers.
 - SQLite separates runs, events, verifier results, artifacts, and human reviews.
