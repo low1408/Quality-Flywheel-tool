@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -125,14 +126,30 @@ def _ingest(path: str | None) -> None:
     conn = connect()
     source = Path(path).read_text(encoding="utf-8").splitlines() if path else sys.stdin.read().splitlines()
     count = 0
-    with conn:
-        for line in source:
-            if not line.strip():
-                continue
+    skipped = 0
+    for line_number, line in enumerate(source, start=1):
+        if not line.strip():
+            continue
+        try:
             row = normalize_envelope(json.loads(line))
-            insert(conn, "events", row)
+            with conn:
+                insert(conn, "events", row)
             count += 1
-    print(f"ingested {count} events")
+        except json.JSONDecodeError as exc:
+            skipped += 1
+            print(f"skipped line {line_number}: invalid JSON: {exc}", file=sys.stderr)
+        except sqlite3.IntegrityError as exc:
+            skipped += 1
+            reason = "duplicate event" if _is_unique_constraint(exc) else f"integrity error: {exc}"
+            print(f"skipped line {line_number}: {reason}", file=sys.stderr)
+    suffix = "" if skipped == 0 else f", skipped {skipped}"
+    print(f"ingested {count} events{suffix}")
+
+
+def _is_unique_constraint(exc: sqlite3.IntegrityError) -> bool:
+    if getattr(exc, "sqlite_errorname", "") in {"SQLITE_CONSTRAINT_UNIQUE", "SQLITE_CONSTRAINT_PRIMARYKEY"}:
+        return True
+    return "UNIQUE constraint failed" in str(exc)
 
 
 def _show(run_id: str) -> None:
