@@ -152,19 +152,175 @@ CREATE TABLE IF NOT EXISTS provider_artifact_revisions (
     created_at TEXT NOT NULL,
     FOREIGN KEY(artifact_id) REFERENCES provider_artifacts(id)
 );
+CREATE INDEX IF NOT EXISTS idx_runs_session_id ON runs (session_id);
+CREATE INDEX IF NOT EXISTS idx_events_run_id ON events (run_id);
+CREATE INDEX IF NOT EXISTS idx_artifacts_run_id ON artifacts (run_id);
+CREATE INDEX IF NOT EXISTS idx_verifier_results_run_id ON verifier_results (run_id);
+CREATE INDEX IF NOT EXISTS idx_human_reviews_run_id ON human_reviews (run_id);
+CREATE INDEX IF NOT EXISTS idx_provider_artifact_revisions_artifact_id ON provider_artifact_revisions (artifact_id);
 """
 
+TABLE_SCHEMAS: dict[str, frozenset[str]] = {
+    "sessions": frozenset(
+        {
+            "id",
+            "repository_path",
+            "repository_remote_hash",
+            "started_at",
+            "ended_at",
+            "final_outcome",
+            "task_summary",
+        }
+    ),
+    "runs": frozenset(
+        {
+            "id",
+            "session_id",
+            "turn_number",
+            "prompt",
+            "prompt_hash",
+            "repository_path",
+            "base_commit",
+            "resulting_commit",
+            "model",
+            "agent_adapter",
+            "agent_version",
+            "wrapper_version",
+            "codex_config_hash",
+            "agents_md_hash",
+            "verifier_version",
+            "started_at",
+            "completed_at",
+            "duration_ms",
+            "agent_status",
+            "verifier_status",
+            "human_status",
+            "lifecycle_status",
+            "input_tokens",
+            "cached_input_tokens",
+            "output_tokens",
+        }
+    ),
+    "events": frozenset(
+        {
+            "id",
+            "schema_version",
+            "event_type",
+            "source_provider",
+            "source_product",
+            "source_event_type",
+            "adapter_version",
+            "session_id",
+            "run_id",
+            "turn_id",
+            "parent_event_id",
+            "sequence_number",
+            "occurred_at",
+            "observed_at",
+            "status",
+            "item_type",
+            "tool_category",
+            "command",
+            "exit_code",
+            "path",
+            "duration_ms",
+            "normalized_payload",
+            "source_payload_sanitized",
+            "provider_extensions",
+            "privacy_status",
+            "privacy_policy_version",
+            "redaction_findings",
+            "normalization_status",
+            "idempotency_key",
+        }
+    ),
+    "artifacts": frozenset({"id", "run_id", "artifact_type", "path", "sha256", "size_bytes"}),
+    "verifier_results": frozenset(
+        {
+            "id",
+            "run_id",
+            "verifier_name",
+            "verifier_category",
+            "command",
+            "started_at",
+            "duration_ms",
+            "exit_code",
+            "passed",
+            "stdout_path",
+            "stderr_path",
+        }
+    ),
+    "human_reviews": frozenset(
+        {
+            "id",
+            "run_id",
+            "outcome",
+            "code_retention",
+            "severity",
+            "primary_failure_category",
+            "contributing_categories",
+            "confidence",
+            "critical_event_sequence",
+            "notes",
+            "reviewed_at",
+        }
+    ),
+    "failure_clusters": frozenset(
+        {
+            "id",
+            "title",
+            "description",
+            "primary_category",
+            "severity",
+            "status",
+            "first_seen_at",
+            "last_seen_at",
+            "occurrence_count",
+            "proposed_intervention",
+            "linked_regression_case",
+        }
+    ),
+    "provider_artifacts": frozenset(
+        {
+            "id",
+            "session_id",
+            "run_id",
+            "created_by_turn_id",
+            "source_provider",
+            "artifact_type",
+            "title",
+            "approval_status",
+            "current_revision_id",
+            "created_at",
+            "updated_at",
+        }
+    ),
+    "provider_artifact_revisions": frozenset(
+        {
+            "id",
+            "artifact_id",
+            "created_by_event_id",
+            "revision_number",
+            "payload_sanitized",
+            "sha256",
+            "created_at",
+        }
+    ),
+}
 
-def connect(path: Path | None = None) -> sqlite3.Connection:
+
+def connect(path: Path | str | None = None) -> sqlite3.Connection:
     ensure_home()
     conn = sqlite3.connect(path or default_db_path())
     conn.row_factory = sqlite3.Row
-    conn.executescript(SCHEMA)
+    conn.execute("PRAGMA foreign_keys = ON")
+    _ensure_schema(conn)
     return conn
 
 
 def insert(conn: sqlite3.Connection, table: str, values: dict[str, Any]) -> None:
     columns = list(values)
+    _validate_table_columns(table, columns)
     placeholders = ", ".join("?" for _ in columns)
     conn.execute(
         f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders})",
@@ -175,8 +331,28 @@ def insert(conn: sqlite3.Connection, table: str, values: dict[str, Any]) -> None
 def update_run(conn: sqlite3.Connection, run_id: str, **values: Any) -> None:
     if not values:
         return
+    _validate_table_columns("runs", values)
     assignments = ", ".join(f"{column}=?" for column in values)
     conn.execute(f"UPDATE runs SET {assignments} WHERE id=?", [*values.values(), run_id])
+
+
+def _validate_table_columns(table: str, columns: Iterable[str]) -> None:
+    allowed = TABLE_SCHEMAS.get(table)
+    if allowed is None:
+        raise ValueError(f"unknown table: {table}")
+    columns = list(columns)
+    if not columns:
+        raise ValueError(f"no columns supplied for {table}")
+    invalid = [column for column in columns if column not in allowed]
+    if invalid:
+        raise ValueError(f"invalid columns for {table}: {', '.join(invalid)}")
+
+
+def _ensure_schema(conn: sqlite3.Connection) -> None:
+    for statement in SCHEMA.split(";"):
+        statement = statement.strip()
+        if statement:
+            conn.execute(statement)
 
 
 def one(conn: sqlite3.Connection, sql: str, args: Iterable[Any] = ()) -> sqlite3.Row | None:
