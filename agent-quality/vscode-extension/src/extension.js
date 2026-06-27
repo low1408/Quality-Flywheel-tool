@@ -313,10 +313,22 @@ class DashboardPanel {
         this.reply(message, { command: "runsLoaded", runs });
         return;
       }
+      if (message.command === "loadSessions") {
+        const folder = this.workspaceFolder();
+        const sessions = await dashboardDbQuery(folder, "sessions", {});
+        this.reply(message, { command: "sessionsLoaded", sessions });
+        return;
+      }
       if (message.command === "loadRunDetails") {
         const folder = this.workspaceFolder();
         const details = await dashboardDbQuery(folder, "details", { run_id: message.run_id });
         this.reply(message, { command: "runDetailsLoaded", ...details });
+        return;
+      }
+      if (message.command === "loadSessionDetails") {
+        const folder = this.workspaceFolder();
+        const details = await dashboardDbQuery(folder, "session_details", { session_id: message.session_id });
+        this.reply(message, { command: "sessionDetailsLoaded", ...details });
         return;
       }
       if (message.command === "saveReview") {
@@ -786,6 +798,52 @@ if action == "runs":
         backfill_prompt_runs(conn)
         conn.commit()
         emit([row_to_dict(row) for row in conn.execute("SELECT * FROM runs ORDER BY started_at DESC, id DESC")])
+elif action == "sessions":
+    if not os.path.exists(db_path):
+        emit([])
+        raise SystemExit(0)
+    with connect() as conn:
+        backfill_prompt_runs(conn)
+        conn.commit()
+        sql = """
+        SELECT
+            s.id AS id,
+            s.repository_path AS repository_path,
+            s.started_at AS started_at,
+            s.ended_at AS ended_at,
+            s.final_outcome AS final_outcome,
+            s.task_summary AS task_summary,
+            1 AS is_session,
+            (SELECT COUNT(*) FROM runs r WHERE r.session_id = s.id) AS turn_count,
+            (SELECT model FROM runs r WHERE r.session_id = s.id ORDER BY turn_number DESC LIMIT 1) AS model,
+            (SELECT agent_adapter FROM runs r WHERE r.session_id = s.id ORDER BY turn_number DESC LIMIT 1) AS agent_adapter,
+            (SELECT agent_status FROM runs r WHERE r.session_id = s.id ORDER BY turn_number DESC LIMIT 1) AS agent_status,
+            (SELECT verifier_status FROM runs r WHERE r.session_id = s.id ORDER BY turn_number DESC LIMIT 1) AS verifier_status,
+            (SELECT human_status FROM runs r WHERE r.session_id = s.id ORDER BY turn_number DESC LIMIT 1) AS human_status
+        FROM sessions s
+        
+        UNION ALL
+        
+        SELECT
+            r.id AS id,
+            r.repository_path AS repository_path,
+            r.started_at AS started_at,
+            r.completed_at AS ended_at,
+            r.verifier_status AS final_outcome,
+            r.prompt AS task_summary,
+            0 AS is_session,
+            1 AS turn_count,
+            r.model AS model,
+            r.agent_adapter AS agent_adapter,
+            r.agent_status AS agent_status,
+            r.verifier_status AS verifier_status,
+            r.human_status AS human_status
+        FROM runs r
+        WHERE r.session_id IS NULL OR r.session_id = ''
+        
+        ORDER BY started_at DESC, id DESC
+        """
+        emit([row_to_dict(row) for row in conn.execute(sql)])
 elif action == "details":
     if not os.path.exists(db_path):
         raise SystemExit("Agent Quality database does not exist yet.")
@@ -823,6 +881,92 @@ elif action == "details":
                     [run_id],
                 )
             ],
+        })
+elif action == "session_details":
+    if not os.path.exists(db_path):
+        raise SystemExit("Agent Quality database does not exist yet.")
+    session_id = payload.get("session_id")
+    with connect() as conn:
+        backfill_prompt_runs(conn)
+        conn.commit()
+        session_row = conn.execute("SELECT * FROM sessions WHERE id=?", [session_id]).fetchone()
+        if session_row:
+            session_dict = row_to_dict(session_row)
+            runs = conn.execute("SELECT * FROM runs WHERE session_id=? ORDER BY turn_number ASC, started_at ASC", [session_id]).fetchall()
+        else:
+            run_row = conn.execute("SELECT * FROM runs WHERE id=?", [session_id]).fetchone()
+            if not run_row:
+                raise SystemExit("unknown session or run: " + str(session_id))
+            run_dict = row_to_dict(run_row)
+            session_dict = {
+                "id": session_id,
+                "repository_path": run_dict["repository_path"],
+                "repository_remote_hash": None,
+                "started_at": run_dict["started_at"],
+                "ended_at": run_dict["completed_at"],
+                "final_outcome": run_dict["verifier_status"],
+                "task_summary": run_dict["prompt"][:240] if run_dict["prompt"] else ""
+            }
+            runs = [run_row]
+        
+        turns_details = []
+        all_artifacts = []
+        all_verifier_results = []
+        all_events = []
+        
+        for run in runs:
+            r_id = run["id"]
+            artifacts = [
+                row_to_dict(row)
+                for row in conn.execute("SELECT * FROM artifacts WHERE run_id=? ORDER BY artifact_type, path", [r_id])
+            ] + event_artifacts(conn, r_id)
+            
+            verifier_results = [
+                row_to_dict(row)
+                for row in conn.execute("SELECT * FROM verifier_results WHERE run_id=? ORDER BY started_at, verifier_name", [r_id])
+            ]
+            
+            events = [
+                event_to_dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM events WHERE run_id=? ORDER BY COALESCE(sequence_number, rowid), rowid",
+                    [r_id],
+                )
+            ]
+            
+            outputs = agent_outputs(conn, r_id)
+            trace = reasoning_trace(conn, r_id)
+            calls = tool_calls(conn, r_id)
+            
+            human_reviews = [
+                row_to_dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM human_reviews WHERE run_id=? ORDER BY reviewed_at DESC, rowid DESC",
+                    [r_id],
+                )
+            ]
+            
+            turns_details.append({
+                "run": row_to_dict(run),
+                "artifacts": artifacts,
+                "verifier_results": verifier_results,
+                "events": events,
+                "agent_outputs": outputs,
+                "reasoning_trace": trace,
+                "tool_calls": calls,
+                "human_reviews": human_reviews
+            })
+            
+            all_artifacts.extend(artifacts)
+            all_verifier_results.extend(verifier_results)
+            all_events.extend(events)
+            
+        emit({
+            "session": session_dict,
+            "turns": turns_details,
+            "all_artifacts": all_artifacts,
+            "all_verifier_results": all_verifier_results,
+            "all_events": all_events
         })
 elif action == "save_review":
     if not os.path.exists(db_path):

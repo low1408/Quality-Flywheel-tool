@@ -924,3 +924,44 @@ button {
     font-size: 13px;
   }
 }
+
+.chat-turn-card {
+  padding: 16px;
+  margin-bottom: 20px;
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+  background: var(--card-bg);
+  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+}
+
+.chat-turn-card .reading-section {
+  margin-bottom: 12px;
+}
+
+.chat-turn-header {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--accent);
+  margin-bottom: 12px;
+  padding-bottom: 8px;
+  border-bottom: 1px dashed var(--border-soft);
+}
+
+.chat-turn-details {
+  margin-top: 12px;
+  border-top: 1px solid var(--border-soft);
+  padding-top: 8px;
+}
+
+.chat-turn-details summary {
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--subtle);
+  outline: none;
+  user-select: none;
+}
+
+.chat-turn-details summary:hover {
+  color: var(--accent);
+}
