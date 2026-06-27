@@ -26,6 +26,7 @@ function activate(context) {
   register(context, "agentQuality.runPrompt", runPrompt);
   register(context, "agentQuality.runSelection", runSelection);
   register(context, "agentQuality.installCodexHooks", installCodexHooks);
+  register(context, "agentQuality.installAntigravityHooks", installAntigravityHooks);
   register(context, "agentQuality.startCollector", startCollector);
   register(context, "agentQuality.stopCollector", stopCollector);
   register(context, "agentQuality.reportSummary", reportSummary);
@@ -122,6 +123,17 @@ async function installCodexHooks() {
   const pythonPath = getConfig().get("pythonPath") || "python3";
   await runAq(["install-codex-hooks", "--repo", projectRootPath(folder), "--python", pythonPath], folder, {
     title: "Install Codex hooks"
+  });
+}
+
+async function installAntigravityHooks() {
+  const folder = await pickWorkspaceFolder();
+  if (!folder) {
+    return;
+  }
+  const pythonPath = getConfig().get("pythonPath") || "python3";
+  await runAq(["install-antigravity-hooks", "--repo", projectRootPath(folder), "--python", pythonPath], folder, {
+    title: "Install Antigravity hooks"
   });
 }
 

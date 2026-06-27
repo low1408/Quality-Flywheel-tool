@@ -14,7 +14,7 @@
     "validate-package": "node -e \"JSON.parse(require('fs').readFileSync('package.json', 'utf8'))\""
   },
   "engines": {
-    "vscode": "^1.90.0"
+    "vscode": "^1.90.0 || ^2.0.0"
   },
   "categories": [
     "Other"
@@ -25,6 +25,7 @@
     "onCommand:agentQuality.runPrompt",
     "onCommand:agentQuality.runSelection",
     "onCommand:agentQuality.installCodexHooks",
+    "onCommand:agentQuality.installAntigravityHooks",
     "onCommand:agentQuality.startCollector",
     "onCommand:agentQuality.stopCollector",
     "onCommand:agentQuality.reportSummary",
@@ -70,6 +71,10 @@
       {
         "command": "agentQuality.installCodexHooks",
         "title": "Agent Quality: Install Codex Hooks"
+      },
+      {
+        "command": "agentQuality.installAntigravityHooks",
+        "title": "Agent Quality: Install Antigravity Hooks"
       },
       {
         "command": "agentQuality.startCollector",
