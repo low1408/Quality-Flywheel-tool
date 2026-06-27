@@ -44,7 +44,7 @@ aq install-codex-hooks --repo /path/to/project
 
 Then restart the Codex IDE extension or start a new Codex session. Codex will ask you to review/trust the project-local hooks before they run. Hook-originated events are stored in the same SQLite database under `.agent-quality/local` when you use the initializer defaults.
 
-This observes documented lifecycle events such as prompt submission, tool use, permission requests, and stop events. It does not scrape the rendered VS Code sidebar stream. For full streamed rich-client events, build against `codex app-server`; for reproducible MVP evaluation, prefer `aq run`, which wraps `codex exec --json`.
+This observes documented lifecycle events such as prompt submission, tool use, permission requests, and stop events. The run overview separates the final agent output, tool calls (including MCP inputs/results), and emitted reasoning summaries or commentary. Private chain-of-thought is encrypted by Codex and is not exposed as plaintext. It does not scrape the rendered VS Code sidebar stream. For full streamed rich-client events, build against `codex app-server`; for reproducible MVP evaluation, prefer `aq run`, which wraps `codex exec --json`.
 
 For smoke testing without Codex, pass a command that emits JSONL:
 

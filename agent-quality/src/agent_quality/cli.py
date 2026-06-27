@@ -111,6 +111,7 @@ def main(argv: list[str] | None = None) -> None:
 
 
 def _init_project(repo: Path) -> None:
+    repo = _project_root(repo)
     aq = repo / ".agent-quality"
     (aq / "cases").mkdir(parents=True, exist_ok=True)
     verify = aq / "verify.yaml"
@@ -142,7 +143,7 @@ def _init_project(repo: Path) -> None:
 
 
 def _install_codex_hooks(repo: Path, python: str) -> None:
-    repo = repo.resolve()
+    repo = _project_root(repo)
     codex_dir = repo / ".codex"
     codex_dir.mkdir(parents=True, exist_ok=True)
     aq_home = repo / ".agent-quality" / "local"
@@ -164,7 +165,53 @@ def _install_codex_hooks(repo: Path, python: str) -> None:
         }
     }
     (codex_dir / "hooks.json").write_text(json.dumps(hooks, indent=2) + "\n", encoding="utf-8")
+    _ensure_codex_hooks_enabled(codex_dir / "config.toml")
     print(f"installed Codex hooks: {codex_dir / 'hooks.json'}")
+    print(f"enabled Codex hooks: {codex_dir / 'config.toml'}")
+
+
+def _project_root(repo: Path) -> Path:
+    path = repo.expanduser().resolve()
+    if path.is_file():
+        path = path.parent
+    for candidate in (path, *path.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return path
+
+
+def _ensure_codex_hooks_enabled(config_path: Path) -> None:
+    if not config_path.exists():
+        config_path.write_text("[features]\nhooks = true\n", encoding="utf-8")
+        return
+
+    lines = config_path.read_text(encoding="utf-8").splitlines()
+    features_start: int | None = None
+    next_table = len(lines)
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped == "[features]":
+            features_start = index
+            continue
+        if features_start is not None and index > features_start and stripped.startswith("[") and stripped.endswith("]"):
+            next_table = index
+            break
+
+    if features_start is None:
+        suffix = "" if not lines or lines[-1] == "" else "\n"
+        config_path.write_text("\n".join(lines) + f"{suffix}\n[features]\nhooks = true\n", encoding="utf-8")
+        return
+
+    for index in range(features_start + 1, next_table):
+        stripped = lines[index].strip()
+        if "=" in stripped and stripped.split("=", 1)[0].strip() == "hooks":
+            indent = lines[index][: len(lines[index]) - len(lines[index].lstrip())]
+            lines[index] = f"{indent}hooks = true"
+            config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            return
+
+    lines.insert(features_start + 1, "hooks = true")
+    config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def _ingest(path: str | None) -> None:

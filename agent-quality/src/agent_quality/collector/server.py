@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import mimetypes
 import sqlite3
@@ -9,6 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
+from agent_quality.adapters.codex_hooks import _artifacts, _assistant_output, _file_links
 from agent_quality.collector.envelope import normalize_envelope
 from agent_quality.db import all_rows, connect, insert, one
 from agent_quality.review.service import save_review_api
@@ -124,11 +126,13 @@ class CollectorHandler(BaseHTTPRequestHandler):
 
     def _handle_ui_runs(self) -> None:
         with connect(self.server.db_path) as conn:
+            _backfill_prompt_runs(conn)
             rows = all_rows(conn, "SELECT * FROM runs ORDER BY started_at DESC, id DESC")
         self._send_json([_row_to_dict(row) for row in rows])
 
     def _handle_ui_run(self, run_id: str) -> None:
         with connect(self.server.db_path) as conn:
+            _backfill_prompt_runs(conn)
             run = one(conn, "SELECT * FROM runs WHERE id=?", [run_id])
             if not run:
                 self._send_json_error(404, "unknown run")
@@ -142,7 +146,8 @@ class CollectorHandler(BaseHTTPRequestHandler):
                         "SELECT * FROM artifacts WHERE run_id=? ORDER BY artifact_type, path",
                         [run_id],
                     )
-                ],
+                ]
+                + _event_artifacts(conn, run_id),
                 "verifier_results": [
                     _row_to_dict(row)
                     for row in all_rows(
@@ -164,6 +169,9 @@ class CollectorHandler(BaseHTTPRequestHandler):
                         [run_id],
                     )
                 ],
+                "agent_outputs": _agent_outputs(conn, run_id),
+                "reasoning_trace": _reasoning_trace(conn, run_id),
+                "tool_calls": _tool_calls(conn, run_id),
                 "human_reviews": [
                     _row_to_dict(row)
                     for row in all_rows(
@@ -290,6 +298,140 @@ def _json_or_value(value: str) -> object:
         return value
 
 
+def _backfill_prompt_runs(conn: sqlite3.Connection) -> None:
+    rows = all_rows(
+        conn,
+        """
+        SELECT *
+        FROM events
+        WHERE source_event_type='UserPromptSubmit'
+          AND (run_id IS NOT NULL OR source_payload_sanitized IS NOT NULL)
+        ORDER BY COALESCE(occurred_at, observed_at), rowid
+        """,
+    )
+    for row in rows:
+        existing_run_id = row["run_id"]
+        if existing_run_id and one(conn, "SELECT id FROM runs WHERE id=?", [existing_run_id]):
+            continue
+        payload = _json_or_value(row["source_payload_sanitized"])
+        if not isinstance(payload, dict):
+            continue
+        hook = (((payload.get("extensions") or {}).get("openai.codex.hook")) or {})
+        if not isinstance(hook, dict):
+            continue
+        prompt = str(hook.get("prompt") or "").strip()
+        if not prompt:
+            continue
+        run_id = existing_run_id or f"run_{_sha256_text(row['id'])[:32]}"
+        if one(conn, "SELECT id FROM runs WHERE id=?", [run_id]):
+            continue
+        session_id = row["session_id"] or hook.get("session_id")
+        started_at = row["occurred_at"] or row["observed_at"]
+        repo_path = str(hook.get("cwd") or "")
+        if session_id:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO sessions (
+                    id, repository_path, repository_remote_hash, started_at, ended_at, final_outcome, task_summary
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (session_id, repo_path or "unknown", None, started_at, None, None, prompt[:240]),
+            )
+            turn_number = (
+                conn.execute("SELECT COALESCE(MAX(turn_number), 0) + 1 AS n FROM runs WHERE session_id=?", [session_id])
+                .fetchone()["n"]
+            )
+        else:
+            turn_number = 1
+        insert(
+            conn,
+            "runs",
+            {
+                "id": run_id,
+                "session_id": session_id,
+                "turn_number": turn_number,
+                "prompt": prompt,
+                "prompt_hash": _sha256_text(prompt),
+                "repository_path": repo_path or "unknown",
+                "base_commit": "unknown",
+                "resulting_commit": None,
+                "model": hook.get("model"),
+                "agent_adapter": "codex-hooks",
+                "agent_version": None,
+                "wrapper_version": None,
+                "codex_config_hash": None,
+                "agents_md_hash": None,
+                "verifier_version": None,
+                "started_at": started_at,
+                "completed_at": None,
+                "duration_ms": None,
+                "agent_status": "prompt_submitted",
+                "verifier_status": "unverified",
+                "human_status": "not_reviewed",
+                "lifecycle_status": "still_open",
+                "input_tokens": None,
+                "cached_input_tokens": None,
+                "output_tokens": None,
+            },
+            or_action="OR IGNORE",
+        )
+    _backfill_session_event_run_ids(conn)
+
+
+def _backfill_session_event_run_ids(conn: sqlite3.Connection) -> None:
+    rows = all_rows(
+        conn,
+        """
+        SELECT rowid, run_id, session_id
+        FROM events
+        WHERE source_event_type='UserPromptSubmit'
+          AND session_id IS NOT NULL
+          AND run_id IS NOT NULL
+        ORDER BY session_id, rowid
+        """,
+    )
+    for row in rows:
+        next_row = one(
+            conn,
+            """
+            SELECT MIN(rowid) AS rowid
+            FROM events
+            WHERE session_id=?
+              AND source_event_type='UserPromptSubmit'
+              AND rowid>?
+            """,
+            [row["session_id"], row["rowid"]],
+        )
+        next_rowid = next_row["rowid"] if next_row else None
+        if next_rowid is None:
+            conn.execute(
+                """
+                UPDATE events
+                SET run_id=?
+                WHERE session_id=?
+                  AND run_id IS NULL
+                  AND rowid>=?
+                """,
+                [row["run_id"], row["session_id"], row["rowid"]],
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE events
+                SET run_id=?
+                WHERE session_id=?
+                  AND run_id IS NULL
+                  AND rowid>=?
+                  AND rowid<?
+                """,
+                [row["run_id"], row["session_id"], row["rowid"], next_rowid],
+            )
+
+
+def _sha256_text(value: object) -> str:
+    return hashlib.sha256(str(value).encode("utf-8")).hexdigest()
+
+
 def _is_known_file_path(conn: sqlite3.Connection, file_path: Path) -> bool:
     requested = _normalized_path(file_path)
     rows = all_rows(
@@ -306,7 +448,181 @@ def _is_known_file_path(conn: sqlite3.Connection, file_path: Path) -> bool:
         candidate = row["path"]
         if candidate and _normalized_path(Path(candidate).expanduser()) == requested:
             return True
+    for candidate in _event_file_paths(conn):
+        if _normalized_path(Path(candidate).expanduser()) == requested:
+            return True
     return False
+
+
+def _agent_outputs(conn: sqlite3.Connection, run_id: str) -> list[dict[str, object]]:
+    outputs: list[dict[str, object]] = []
+    rows = all_rows(
+        conn,
+        """
+        SELECT *
+        FROM events
+        WHERE run_id=?
+        ORDER BY COALESCE(sequence_number, rowid), rowid
+        """,
+        [run_id],
+    )
+    for row in rows:
+        payload = _json_or_value(row["normalized_payload"])
+        hook = _hook_payload(row)
+        text = None
+        file_links = []
+        if isinstance(payload, dict):
+            text = payload.get("assistant_output")
+            file_links = payload.get("file_links") if isinstance(payload.get("file_links"), list) else []
+        if not text and hook:
+            text = _assistant_output(row["source_event_type"], hook)
+            file_links = _file_links(hook, str(text) if text else None)
+        if not text:
+            continue
+        outputs.append(
+            {
+                "event_id": row["id"],
+                "sequence_number": row["sequence_number"],
+                "occurred_at": row["occurred_at"] or row["observed_at"],
+                "text": str(text),
+                "file_links": file_links,
+            }
+        )
+    return outputs
+
+
+def _reasoning_trace(conn: sqlite3.Connection, run_id: str) -> list[dict[str, object]]:
+    trace: list[dict[str, object]] = []
+    for row in all_rows(
+        conn,
+        "SELECT * FROM events WHERE run_id=? ORDER BY COALESCE(occurred_at, observed_at), rowid",
+        [run_id],
+    ):
+        payload = _json_or_value(row["normalized_payload"])
+        if not isinstance(payload, dict) or not payload.get("reasoning"):
+            continue
+        trace.append(
+            {
+                "event_id": row["id"],
+                "occurred_at": row["occurred_at"] or row["observed_at"],
+                "kind": payload.get("reasoning_kind") or "summary",
+                "text": str(payload["reasoning"]),
+            }
+        )
+    return trace
+
+
+def _tool_calls(conn: sqlite3.Connection, run_id: str) -> list[dict[str, object]]:
+    calls: list[dict[str, object]] = []
+    by_id: dict[str, dict[str, object]] = {}
+    rows = all_rows(
+        conn,
+        "SELECT * FROM events WHERE run_id=? ORDER BY COALESCE(sequence_number, rowid), rowid",
+        [run_id],
+    )
+    for row in rows:
+        payload = _json_or_value(row["normalized_payload"])
+        payload = payload if isinstance(payload, dict) else {}
+        hook = _hook_payload(row) or {}
+        source_type = str(row["source_event_type"] or "")
+        is_started = source_type == "PreToolUse" or row["event_type"] == "agent.tool.started"
+        is_completed = source_type == "PostToolUse" or row["event_type"] == "agent.tool.completed"
+        if not is_started and not is_completed:
+            continue
+        call_id = payload.get("tool_call_id") or hook.get("tool_use_id") or hook.get("call_id")
+        tool_name = payload.get("tool_name") or hook.get("tool_name") or hook.get("toolName")
+        tool_category = row["tool_category"] or payload.get("tool_category")
+        if isinstance(tool_name, str) and tool_name.lower().startswith("mcp__"):
+            tool_category = "mcp"
+        key = str(call_id) if call_id else f"{tool_name}:{row['id']}"
+        call = by_id.get(key)
+        if call is None:
+            call = {
+                "event_id": row["id"],
+                "call_id": call_id,
+                "occurred_at": row["occurred_at"] or row["observed_at"],
+                "tool_name": tool_name or row["tool_category"] or "tool",
+                "tool_category": tool_category,
+                "status": row["status"],
+                "input": payload.get("tool_input", hook.get("tool_input", hook.get("toolInput"))),
+                "output": None,
+            }
+            by_id[key] = call
+            calls.append(call)
+        elif call.get("input") is None:
+            call["input"] = payload.get("tool_input", hook.get("tool_input", hook.get("toolInput")))
+        if is_completed:
+            call["status"] = row["status"] or "completed"
+            call["output"] = payload.get(
+                "tool_output",
+                hook.get("tool_response", hook.get("toolResponse")),
+            )
+    return calls
+
+
+def _event_artifacts(conn: sqlite3.Connection, run_id: str) -> list[dict[str, object]]:
+    artifacts: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for row in all_rows(conn, "SELECT * FROM events WHERE run_id=? ORDER BY rowid", [run_id]):
+        for item in _event_artifact_items(row):
+            path = item.get("path")
+            if not isinstance(path, str) or not path or path in seen:
+                continue
+            seen.add(path)
+            file_path = Path(path).expanduser()
+            size = file_path.stat().st_size if file_path.exists() and file_path.is_file() else None
+            artifacts.append(
+                {
+                    "id": f"event_artifact_{_sha256_text(path)[:16]}",
+                    "run_id": run_id,
+                    "artifact_type": item.get("artifact_type") or "linked_file",
+                    "path": path,
+                    "line": item.get("line"),
+                    "sha256": None,
+                    "size_bytes": size,
+                }
+            )
+    return artifacts
+
+
+def _event_file_paths(conn: sqlite3.Connection) -> list[str]:
+    paths: list[str] = []
+    for row in all_rows(conn, "SELECT * FROM events"):
+        for item in _event_artifact_items(row):
+            path = item.get("path")
+            if isinstance(path, str) and path:
+                paths.append(path)
+    return paths
+
+
+def _event_artifact_items(row: sqlite3.Row) -> list[dict[str, object]]:
+    items: list[dict[str, object]] = []
+    payload = _json_or_value(row["normalized_payload"])
+    if isinstance(payload, dict):
+        if isinstance(payload.get("path"), str) and payload["path"]:
+            items.append({"artifact_type": "event_path", "path": payload["path"]})
+        for link in payload.get("file_links") or []:
+            if isinstance(link, dict) and isinstance(link.get("path"), str):
+                items.append({"artifact_type": "linked_file", **link})
+        for artifact in payload.get("artifacts") or []:
+            if isinstance(artifact, dict) and isinstance(artifact.get("path"), str):
+                items.append(artifact)
+    hook = _hook_payload(row)
+    if hook:
+        for artifact in _artifacts(hook):
+            items.append(artifact)
+        output = _assistant_output(row["source_event_type"], hook)
+        for link in _file_links(hook, output):
+            items.append({"artifact_type": "linked_file", **link})
+    return items
+
+
+def _hook_payload(row: sqlite3.Row) -> dict[str, object] | None:
+    extensions = _json_or_value(row["provider_extensions"])
+    if not isinstance(extensions, dict):
+        return None
+    hook = extensions.get("openai.codex.hook")
+    return hook if isinstance(hook, dict) else None
 
 
 def _normalized_path(path: Path) -> str:

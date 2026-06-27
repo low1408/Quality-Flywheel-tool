@@ -19,7 +19,7 @@
         </div>
         <div class="top-actions">
           <span id="syncState" class="sync-state">Idle</span>
-          <button type="button" class="button ghost" data-action="refresh" title="Refresh runs">Refresh</button>
+          <button type="button" class="button ghost" data-action="refresh" title="Sync prompts from the database">Sync</button>
         </div>
       </header>
 
@@ -32,7 +32,7 @@
             </div>
           </div>
           <div class="rail-controls">
-            <input id="runSearch" type="search" autocomplete="off" placeholder="Search">
+            <input id="runSearch" type="search" autocomplete="off" placeholder="Search runs" aria-label="Search runs by prompt, model, repository, status, or run ID">
             <select id="statusFilter" aria-label="Status filter">
               <option value="all">All statuses</option>
               <option value="passed">Verifier passed</option>

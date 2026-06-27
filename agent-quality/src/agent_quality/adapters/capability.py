@@ -3,6 +3,7 @@ from __future__ import annotations
 CODEX_CLI_CAPABILITIES = {
     "prompt_submitted": True,
     "assistant_output": True,
+    "reasoning_summaries": True,
     "tool_started": True,
     "tool_completed": True,
     "file_mutations": True,

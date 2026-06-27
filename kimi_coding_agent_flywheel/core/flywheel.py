@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +42,10 @@ from regression.regression_suite import QualityGate, RegressionReport, Regressio
 from monitoring.dashboard import ConsoleDashboard, ProductionMonitor, UserFeedbackCollector
 
 
+def utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
 @dataclass
 class FlywheelConfig:
     """Configuration for the quality flywheel."""
@@ -52,6 +56,8 @@ class FlywheelConfig:
 
     # Failure analysis
     enable_llm_judge: bool = True
+    judge_fn: Any | None = None  # Callable[[str], str] when LLM judge is enabled
+    use_mock_judge: bool = False  # Only for demos/tests; never implicit
     min_cluster_size: int = 2
     embedding_fn: Any | None = None  # Function for generating embeddings
 
@@ -79,6 +85,8 @@ class FlywheelConfig:
             "max_concurrent_evals": self.max_concurrent_evals,
             "eval_timeout": self.eval_timeout,
             "enable_llm_judge": self.enable_llm_judge,
+            "judge_configured": self.judge_fn is not None,
+            "use_mock_judge": self.use_mock_judge,
             "min_cluster_size": self.min_cluster_size,
             "genetic_generations": self.genetic_generations,
             "genetic_population": self.genetic_population,
@@ -97,7 +105,7 @@ class FlywheelConfig:
 class FlywheelState:
     """Current state of the quality flywheel."""
     iteration: int = 0
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+    timestamp: datetime = field(default_factory=utc_now)
 
     # Current best configuration
     current_prompt: str = ""
@@ -158,6 +166,10 @@ class QualityFlywheel:
         # Storage
         self.output_dir = Path(self.config.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # SQLite Database Ingestion Adapter
+        from core.aq_adapter import AQDbAdapter
+        self.db_adapter = AQDbAdapter()
 
     async def initialize(self) -> None:
         """Initialize all flywheel components."""
@@ -176,16 +188,23 @@ class QualityFlywheel:
             print("Created new benchmark suite")
 
         # 2. Initialize failure analysis pipeline
-        diagnoser = LLMJudgeDiagnoser() if self.config.enable_llm_judge else LLMJudgeDiagnoser(judge_fn=None)
-        clusterer = FailureClusteringEngine(
-            embedding_fn=self.config.embedding_fn,
-            min_cluster_size=self.config.min_cluster_size,
-        )
-        self.failure_pipeline = FailureAnalysisPipeline(
-            diagnoser=diagnoser,
-            clusterer=clusterer,
-        )
-        print("Initialized failure analysis pipeline")
+        if self.config.enable_llm_judge:
+            diagnoser = LLMJudgeDiagnoser(
+                judge_fn=self.config.judge_fn,
+                use_mock_judge=self.config.use_mock_judge,
+            )
+            clusterer = FailureClusteringEngine(
+                embedding_fn=self.config.embedding_fn,
+                min_cluster_size=self.config.min_cluster_size,
+            )
+            self.failure_pipeline = FailureAnalysisPipeline(
+                diagnoser=diagnoser,
+                clusterer=clusterer,
+            )
+            print("Initialized failure analysis pipeline")
+        else:
+            self.failure_pipeline = None
+            print("Failure analysis disabled")
 
         # 3. Initialize prompt optimizer (will be set up per-agent)
         print("Prompt optimizer ready (will be configured per-agent)")
@@ -198,6 +217,13 @@ class QualityFlywheel:
         else:
             self.regression_suite = RegressionSuite(name="default")
             print("Created new regression suite")
+
+        # Sync with agent-quality cases directory
+        try:
+            self.regression_suite.load_from_aq_cases()
+            print(f"Synced with agent-quality regression cases. Total tests: {len(self.regression_suite.tests)}")
+        except Exception as e:
+            print(f"Warning: Failed to sync with agent-quality cases: {e}")
 
         # 5. Initialize quality gate
         self.quality_gate = QualityGate(
@@ -242,12 +268,12 @@ class QualityFlywheel:
         print(f"\n{'#' * 60}")
         print(f"# FLYWHEEL ITERATION {iteration}")
         print(f"# Agent: {agent.name} ({agent.model_id or 'unknown'})")
-        print(f"# Time: {datetime.utcnow().isoformat()}")
+        print(f"# Time: {utc_now().isoformat()}")
         print(f"{'#' * 60}")
 
         results = {
             "iteration": iteration,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": utc_now().isoformat(),
             "agent": {"name": agent.name, "model": agent.model_id},
         }
 
@@ -288,35 +314,76 @@ class QualityFlywheel:
         print("PHASE 2: FAILURE DIAGNOSIS & CLUSTERING")
         print(f"{'=' * 50}")
 
-        # Load traces from evaluation
-        trace_dir = Path(self.config.trace_dir)
+        # Load traces from SQLite database (Option A) and fallback to disk (Option B)
         traces = []
-        if trace_dir.exists():
-            for trace_file in trace_dir.glob(f"*{agent.name}*/*.json"):
-                try:
-                    with open(trace_file) as f:
-                        traces.append(json.load(f))
-                except Exception:
-                    pass
+        try:
+            # Query task/session IDs evaluated in this benchmark run
+            task_ids = [str(tid) for tid in self.benchmark_suite.tasks.keys()] if self.benchmark_suite else []
+            if task_ids:
+                db_traces = self.db_adapter.load_session_traces(task_ids)
+                traces = [t.to_dict() for t in db_traces]
+        except Exception as e:
+            import sys
+            print(f"Warning: Failed to load traces from SQLite: {e}", file=sys.stderr)
+
+        if not traces:
+            # Fallback: scan JSON directory
+            trace_dir = Path(self.config.trace_dir)
+            if trace_dir.exists():
+                for trace_file in trace_dir.glob(f"*{agent.name}*/*.json"):
+                    try:
+                        with open(trace_file) as f:
+                            traces.append(json.load(f))
+                    except Exception:
+                        pass
 
         # Process traces through failure pipeline
-        if traces:
+        if traces and self.failure_pipeline:
             failures = self.failure_pipeline.process_traces(traces)
+            
+            # Save diagnosed failure instances to SQLite
+            try:
+                self.db_adapter.save_failures(failures)
+            except Exception as e:
+                import sys
+                print(f"Warning: Failed to save failure instances to SQLite: {e}", file=sys.stderr)
+                
             clusters = self.failure_pipeline.run_clustering()
 
             self.state.total_failures_diagnosed += len(failures)
             self.state.known_failure_clusters = [c.to_dict() for c in clusters]
 
+            # Persist failure analysis run and failure clusters/memberships to SQLite
+            try:
+                analysis_id = f"analysis_dbscan_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                self.db_adapter.save_analysis_run(
+                    analysis_id=analysis_id,
+                    algorithm="DBSCAN",
+                    parameters=json.dumps({"min_cluster_size": self.config.min_cluster_size}),
+                    judge_version="1.0",
+                    redaction_version="redaction-1.0",
+                    status="completed",
+                )
+                self.db_adapter.save_clusters(analysis_id, clusters)
+            except Exception as e:
+                import sys
+                print(f"Warning: Failed to save clusters to SQLite: {e}", file=sys.stderr)
+
             results["diagnosis"] = {
                 "failures_found": len(failures),
+                "diagnosis_errors": len(self.failure_pipeline.diagnosis_errors),
                 "clusters_identified": len(clusters),
                 "top_clusters": [c.to_dict() for c in clusters[:5]],
             }
 
             print(f"  Failures diagnosed: {len(failures)}")
+            print(f"  Diagnosis errors: {len(self.failure_pipeline.diagnosis_errors)}")
             print(f"  Clusters identified: {len(clusters)}")
             for c in clusters[:5]:
                 print(f"    - {c.label}: {len(c.failures)} failures")
+        elif traces:
+            print("  Failure analysis disabled")
+            results["diagnosis"] = {"status": "disabled", "failures_found": 0, "clusters_identified": 0}
         else:
             print("  No traces found for analysis")
             results["diagnosis"] = {"failures_found": 0, "clusters_identified": 0}
@@ -394,14 +461,22 @@ class QualityFlywheel:
 
         # Add new regression tests from identified failures
         if self.failure_pipeline:
+            import agent_quality.regressions.registry as aq_registry
             for cluster in self.failure_pipeline.clusterer.clusters:
                 for failure in cluster.failures[:1]:  # Add one per cluster
-                    task_data = {"task_id": failure.task_id, "instruction": failure.description}
-                    self.regression_suite.add_test_from_failure(
-                        failure_id=failure.failure_id,
-                        task=task_data,
-                        cluster_id=cluster.cluster_id,
-                    )
+                    try:
+                        # Promote run/failure directly in agent-quality
+                        aq_registry.promote(run_id=failure.task_id, case_id=failure.failure_id)
+                        # Register internally in Kimi
+                        task_data = {"task_id": f"regression::{failure.failure_id}", "instruction": failure.description}
+                        self.regression_suite.add_test_from_failure(
+                            failure_id=failure.failure_id,
+                            task=task_data,
+                            cluster_id=cluster.cluster_id,
+                        )
+                    except Exception as e:
+                        import sys
+                        print(f"Warning: Failed to promote failure {failure.failure_id} to agent-quality: {e}", file=sys.stderr)
 
         # Run regression suite
         reg_report = await self.regression_suite.run_regression(
@@ -456,7 +531,7 @@ class QualityFlywheel:
             if isinstance(t, dict):
                 pt = ProductionTrace(
                     trace_id=t.get("trace_id", ""),
-                    timestamp=datetime.fromisoformat(t["timestamp"]) if "timestamp" in t else datetime.utcnow(),
+                    timestamp=datetime.fromisoformat(t["timestamp"]) if "timestamp" in t else utc_now(),
                     agent_name=t.get("agent_name", "unknown"),
                     model_id=t.get("model_id"),
                     task_type=t.get("task_type", ""),

@@ -339,12 +339,16 @@ class Tracer:
     Provides a convenient context-manager-based API for recording traces.
     """
 
-    def __init__(self, agent_name: str, model_id: str | None = None, output_dir: str = "data/traces"):
+    def __init__(self, agent_name: str, model_id: str | None = None, output_dir: str = "data/traces", db_path: str | None = None):
         self.agent_name = agent_name
         self.model_id = model_id
         self.output_dir = Path(output_dir)
         self._current_trace: Trace | None = None
         self._current_span_stack: list[str] = []
+        
+        # SQLite Database Ingestion Adapter
+        from core.aq_adapter import AQDbAdapter
+        self.db_adapter = AQDbAdapter(db_path)
 
     @contextmanager
     def trace(self, task_id: str | None = None, **metadata: Any) -> Iterator[Trace]:
@@ -552,9 +556,63 @@ class Tracer:
         trace.add_event(event)
 
     def _save_trace(self, trace: Trace) -> None:
-        """Persist trace to disk."""
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        trace.save(str(self.output_dir))
+        """Persist trace to database and fallback to disk."""
+        try:
+            session_id = trace.task_id or "default_session"
+            # Ensure session exists
+            self.db_adapter.save_session(
+                session_id=session_id,
+                repository_path=str(Path.cwd()),
+                started_at=trace.start_time,
+                task_summary=f"Kimi benchmark task: {trace.trace_id}",
+            )
+            
+            # Count tokens
+            input_tokens = sum(e.tokens_in for e in trace.events if e.tokens_in)
+            output_tokens = sum(e.tokens_out for e in trace.events if e.tokens_out)
+            duration_ms = int(trace.duration_sec * 1000)
+            
+            # Save run record
+            self.db_adapter.save_run(
+                run_id=trace.trace_id,
+                session_id=session_id,
+                turn_number=1,
+                prompt=trace.system_prompt or "kimi evaluation task",
+                model=trace.model_id,
+                started_at=trace.start_time,
+                completed_at=trace.end_time or datetime.utcnow(),
+                duration_ms=duration_ms,
+                agent_status="completed" if not trace.has_errors else "failed",
+                verifier_status="passed" if not trace.has_errors else "failed",
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+            )
+            
+            # Save redacted events
+            self.db_adapter.save_events(
+                run_id=trace.trace_id,
+                session_id=session_id,
+                events=trace.events,
+            )
+            
+            # Save prompt artifact
+            if trace.system_prompt:
+                self.db_adapter.save_artifact(
+                    run_id=trace.trace_id,
+                    artifact_type="prompt",
+                    name="prompt.txt",
+                    content=trace.system_prompt,
+                )
+        except Exception as e:
+            import sys
+            print(f"Warning: Failed to save trace to SQLite: {e}", file=sys.stderr)
+
+        # Fallback JSON serialization for local caching/compatibility
+        try:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            trace.save(str(self.output_dir))
+        except Exception:
+            pass
 
 
 # -----------------------------------------------------------------------------

@@ -10,11 +10,13 @@ This module implements:
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -162,6 +164,13 @@ CATEGORY_GROUPS: dict[str, list[str]] = {
     ],
 }
 
+VALID_SEVERITIES = {"low", "medium", "high", "critical"}
+ANALYSIS_STATE_SCHEMA_VERSION = 1
+
+
+def utc_now() -> datetime:
+    return datetime.now(UTC)
+
 
 # -----------------------------------------------------------------------------
 # Data Structures
@@ -193,7 +202,7 @@ class FailureInstance:
     affected_prompt_component: str | None = None  # Which part of prompt caused this
 
     # Metadata
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+    timestamp: datetime = field(default_factory=utc_now)
     llm_judge_score: float | None = None  # 0-10 from LLM judge
     embedding: list[float] | None = None   # Vector representation for clustering
 
@@ -218,6 +227,49 @@ class FailureInstance:
             "llm_judge_score": self.llm_judge_score,
             "embedding": self.embedding,
         }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> FailureInstance:
+        """Reconstruct a failure from persisted analysis state."""
+        timestamp = data.get("timestamp")
+        parsed_timestamp = utc_now()
+        if isinstance(timestamp, str):
+            try:
+                parsed_timestamp = datetime.fromisoformat(timestamp)
+                if parsed_timestamp.tzinfo is None:
+                    parsed_timestamp = parsed_timestamp.replace(tzinfo=UTC)
+                else:
+                    parsed_timestamp = parsed_timestamp.astimezone(UTC)
+            except ValueError:
+                pass
+
+        return cls(
+            failure_id=str(data.get("failure_id", "")),
+            task_id=str(data.get("task_id", "unknown")),
+            agent_name=str(data.get("agent_name", "unknown")),
+            model_id=data.get("model_id"),
+            category=data.get("category"),
+            subcategory=data.get("subcategory"),
+            description=str(data.get("description", "")),
+            severity=str(data.get("severity", "medium")),
+            trace_id=data.get("trace_id"),
+            trace_snippet=str(data.get("trace_snippet", "")),
+            error_message=str(data.get("error_message", "")),
+            failing_test=data.get("failing_test"),
+            probable_cause=str(data.get("probable_cause", "")),
+            suggested_fix=str(data.get("suggested_fix", "")),
+            affected_prompt_component=data.get("affected_prompt_component"),
+            timestamp=parsed_timestamp,
+            llm_judge_score=data.get("llm_judge_score"),
+            embedding=data.get("embedding"),
+        )
+
+
+@dataclass
+class EmbeddedFailure:
+    """A failure and the exact text used to embed it."""
+    failure: FailureInstance
+    embedding_text: str
 
 
 @dataclass
@@ -263,6 +315,62 @@ class FailureCluster:
             "suggested_tool_fix": self.suggested_tool_fix,
             "regression_tests_needed": self.regression_tests_needed,
         }
+
+
+@dataclass
+class DiagnosedFailures:
+    """Successful diagnosis result for one trace."""
+    failures: list[FailureInstance]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "type": "diagnosed_failures",
+            "failures": [failure.to_dict() for failure in self.failures],
+        }
+
+
+@dataclass
+class DiagnosisInfrastructureError:
+    """The judge failed outside the analyzed agent run."""
+    trace_id: str | None
+    task_id: str
+    agent_name: str
+    message: str
+    exception_type: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "type": "infrastructure_error",
+            "trace_id": self.trace_id,
+            "task_id": self.task_id,
+            "agent_name": self.agent_name,
+            "message": self.message,
+            "exception_type": self.exception_type,
+        }
+
+
+@dataclass
+class DiagnosisInvalidResponse:
+    """The judge responded, but not with the required schema."""
+    trace_id: str | None
+    task_id: str
+    agent_name: str
+    message: str
+    response_excerpt: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "type": "invalid_response",
+            "trace_id": self.trace_id,
+            "task_id": self.task_id,
+            "agent_name": self.agent_name,
+            "message": self.message,
+            "response_excerpt": self.response_excerpt,
+        }
+
+
+DiagnosisResult = DiagnosedFailures | DiagnosisInfrastructureError | DiagnosisInvalidResponse
+DiagnosisError = DiagnosisInfrastructureError | DiagnosisInvalidResponse
 
 
 # -----------------------------------------------------------------------------
@@ -331,20 +439,31 @@ Format your response as JSON:
 }}
 """
 
-    def __init__(self, judge_fn: Callable[[str], str] | None = None):
+    def __init__(
+        self,
+        judge_fn: Callable[[str], str] | None = None,
+        *,
+        use_mock_judge: bool = False,
+    ):
         """
         Args:
             judge_fn: Function that takes a prompt string and returns the judge's response.
-                     If None, uses a mock implementation for testing.
+            use_mock_judge: Explicitly opt into the built-in testing mock.
         """
+        if judge_fn is None and not use_mock_judge:
+            raise ValueError(
+                "LLMJudgeDiagnoser requires an explicit judge_fn. "
+                "Pass use_mock_judge=True only in tests or demos."
+            )
         self.judge_fn = judge_fn or self._mock_judge
         self._failure_type_list = ", ".join(FAILURE_DESCRIPTIONS.keys())
 
-    def diagnose(self, trace_data: dict[str, Any], task_description: str = "") -> list[FailureInstance]:
+    def diagnose(self, trace_data: dict[str, Any], task_description: str = "") -> DiagnosisResult:
         """
         Diagnose failures from a single execution trace.
 
-        Returns a list of FailureInstance objects, one per identified failure.
+        Returns a discriminated result. Judge infrastructure failures and invalid
+        judge responses are not converted into agent failures.
         """
         # Build the diagnosis prompt
         prompt = self.DIAGNOSIS_PROMPT_TEMPLATE.format(
@@ -359,22 +478,20 @@ Format your response as JSON:
 
         # Call the judge
         try:
-            response = self.judge_fn(prompt)
-            parsed = self._parse_judge_response(response, trace_data)
-            return parsed
+            # Egress Redaction: enforce safety pass immediately before LLM call
+            from agent_quality.privacy.redaction import redact_text
+            redacted_prompt = redact_text(prompt).value
+            response = self.judge_fn(redacted_prompt)
         except Exception as e:
-            # Fallback: create a generic failure instance
-            return [FailureInstance(
-                failure_id=f"diag_{trace_data.get('trace_id', 'unknown')}_0",
-                task_id=trace_data.get("task_id", "unknown"),
-                agent_name=trace_data.get("agent_name", "unknown"),
-                model_id=trace_data.get("model_id"),
-                category="unknown",
-                subcategory="diagnosis_failed",
-                description=f"Failed to diagnose: {str(e)}",
-                severity="medium",
+            return DiagnosisInfrastructureError(
                 trace_id=trace_data.get("trace_id"),
-            )]
+                task_id=str(trace_data.get("task_id", "unknown")),
+                agent_name=str(trace_data.get("agent_name", "unknown")),
+                message=str(e),
+                exception_type=type(e).__name__,
+            )
+
+        return self._parse_judge_response(response, trace_data)
 
     def _extract_relevant_trace(self, trace_data: dict[str, Any]) -> str:
         """Extract the most relevant portion of the trace for diagnosis."""
@@ -422,8 +539,15 @@ Format your response as JSON:
                 errors.append(f"Tool {event.get('tool_name')}: {event.get('tool_error')}")
         return "\n".join(errors) if errors else "No explicit errors found"
 
-    def _parse_judge_response(self, response: str, trace_data: dict[str, Any]) -> list[FailureInstance]:
+    def _parse_judge_response(self, response: str, trace_data: dict[str, Any]) -> DiagnosisResult:
         """Parse the judge's JSON response into FailureInstance objects."""
+        if not isinstance(response, str):
+            return self._invalid_response(
+                trace_data,
+                f"Judge response must be a string, got {type(response).__name__}",
+                repr(response),
+            )
+
         # Try to extract JSON from response
         try:
             # Find JSON block
@@ -432,41 +556,100 @@ Format your response as JSON:
                 data = json.loads(json_match.group())
             else:
                 data = json.loads(response)
-        except json.JSONDecodeError:
-            # Fallback: treat entire response as description
-            return [FailureInstance(
-                failure_id=f"diag_{trace_data.get('trace_id', 'unknown')}_0",
-                task_id=trace_data.get("task_id", "unknown"),
-                agent_name=trace_data.get("agent_name", "unknown"),
-                model_id=trace_data.get("model_id"),
-                description=response[:500],
-                severity="medium",
-                trace_id=trace_data.get("trace_id"),
-            )]
+        except json.JSONDecodeError as e:
+            return self._invalid_response(
+                trace_data,
+                f"Judge response was not valid JSON: {e.msg}",
+                response,
+            )
+
+        if not isinstance(data, dict):
+            return self._invalid_response(trace_data, "Judge response JSON must be an object", response)
+
+        overall_score = data.get("overall_score")
+        if not isinstance(overall_score, (int, float)) or not 0 <= float(overall_score) <= 10:
+            return self._invalid_response(
+                trace_data,
+                "Judge response overall_score must be a number from 0 to 10",
+                response,
+            )
+
+        failure_items = data.get("failures")
+        if not isinstance(failure_items, list):
+            return self._invalid_response(trace_data, "Judge response failures must be a list", response)
 
         failures = []
-        for i, failure_data in enumerate(data.get("failures", [])):
-            subcategory = failure_data.get("subcategory", "unknown")
+        for i, failure_data in enumerate(failure_items):
+            if not isinstance(failure_data, dict):
+                return self._invalid_response(
+                    trace_data,
+                    f"Judge response failure at index {i} must be an object",
+                    response,
+                )
+
+            subcategory = failure_data.get("subcategory")
+            if not isinstance(subcategory, str) or subcategory not in FAILURE_DESCRIPTIONS:
+                return self._invalid_response(
+                    trace_data,
+                    f"Judge response failure at index {i} has unknown subcategory",
+                    response,
+                )
+
+            severity = failure_data.get("severity")
+            if not isinstance(severity, str) or severity.lower() not in VALID_SEVERITIES:
+                return self._invalid_response(
+                    trace_data,
+                    f"Judge response failure at index {i} has invalid severity",
+                    response,
+                )
+
             category = self._subcategory_to_category(subcategory)
 
             fi = FailureInstance(
-                failure_id=f"diag_{trace_data.get('trace_id', 'unknown')}_{i}",
-                task_id=trace_data.get("task_id", "unknown"),
-                agent_name=trace_data.get("agent_name", "unknown"),
+                failure_id=self._failure_id(trace_data, failure_data, i),
+                task_id=str(trace_data.get("task_id", "unknown")),
+                agent_name=str(trace_data.get("agent_name", "unknown")),
                 model_id=trace_data.get("model_id"),
                 category=category,
                 subcategory=subcategory,
-                description=failure_data.get("description", ""),
-                severity=failure_data.get("severity", "medium").lower(),
+                description=str(failure_data.get("description", "")),
+                severity=severity.lower(),
                 trace_id=trace_data.get("trace_id"),
-                probable_cause=failure_data.get("root_cause", ""),
-                suggested_fix=failure_data.get("suggested_fix", ""),
+                probable_cause=str(failure_data.get("root_cause", "")),
+                suggested_fix=str(failure_data.get("suggested_fix", "")),
                 affected_prompt_component=failure_data.get("affected_prompt_component"),
-                llm_judge_score=data.get("overall_score"),
+                llm_judge_score=float(overall_score),
             )
             failures.append(fi)
 
-        return failures
+        return DiagnosedFailures(failures)
+
+    def _failure_id(self, trace_data: dict[str, Any], failure_data: dict[str, Any], index: int) -> str:
+        """Build a stable failure id with a content hash to avoid unknown-trace collisions."""
+        trace_part = str(trace_data.get("trace_id") or "unknown")
+        payload = {
+            "trace_id": trace_data.get("trace_id"),
+            "task_id": trace_data.get("task_id"),
+            "agent_name": trace_data.get("agent_name"),
+            "index": index,
+            "failure": failure_data,
+        }
+        digest = hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:12]
+        return f"diag_{trace_part}_{index}_{digest}"
+
+    def _invalid_response(
+        self,
+        trace_data: dict[str, Any],
+        message: str,
+        response: str,
+    ) -> DiagnosisInvalidResponse:
+        return DiagnosisInvalidResponse(
+            trace_id=trace_data.get("trace_id"),
+            task_id=str(trace_data.get("task_id", "unknown")),
+            agent_name=str(trace_data.get("agent_name", "unknown")),
+            message=message,
+            response_excerpt=response[:500],
+        )
 
     def _subcategory_to_category(self, subcategory: str) -> str:
         """Map a subcategory to its parent category."""
@@ -561,31 +744,53 @@ class FailureClusteringEngine:
         self.min_cluster_size = min_cluster_size
         self.eps = eps
         self.clusters: list[FailureCluster] = []
-        self._failure_texts: list[str] = []
+        self._embedded_failures: list[EmbeddedFailure] = []
+        self._failure_ids: set[str] = set()
         self._embeddings: np.ndarray | None = None
 
     def add_failures(self, failures: list[FailureInstance]) -> None:
         """Add failures to the clustering engine."""
         for f in failures:
-            # Create prefixed text for embedding (task + description)
-            text = f"Task: {f.task_id}. Failure: {f.description}. Error: {f.error_message}"
-            self._failure_texts.append(text)
+            if f.failure_id in self._failure_ids:
+                continue
+            self._embedded_failures.append(self._embed_failure(f))
+            self._failure_ids.add(f.failure_id)
 
-    def cluster(self) -> list[FailureCluster]:
+    def cluster(self, failures: list[FailureInstance] | None = None) -> list[FailureCluster]:
         """
         Cluster failures by semantic similarity.
 
+        Args:
+            failures: Optional explicit failure collection. When supplied, the
+                clustering run uses exactly this collection instead of mutable
+                accumulated state.
+
         Returns list of FailureCluster objects.
         """
-        if len(self._failure_texts) < self.min_cluster_size:
+        embedded_failures = (
+            [self._embed_failure(f) for f in failures]
+            if failures is not None
+            else self._embedded_failures
+        )
+        if failures is not None:
+            self._embedded_failures = embedded_failures
+            self._failure_ids = {item.failure.failure_id for item in embedded_failures}
+
+        if len(embedded_failures) < self.min_cluster_size:
+            self.clusters = []
+            self._embeddings = None
             return []
 
+        embedding_texts = [item.embedding_text for item in embedded_failures]
+
         # Generate embeddings
-        embeddings = self.embedding_fn(self._failure_texts)
+        embeddings = self.embedding_fn(embedding_texts)
         self._embeddings = np.array(embeddings)
+        for embedded_failure, embedding in zip(embedded_failures, embeddings):
+            embedded_failure.failure.embedding = list(embedding)
 
         # Cluster using HDBSCAN or DBSCAN
-        if len(self._failure_texts) >= 10:
+        if len(embedded_failures) >= 10:
             try:
                 clusterer = HDBSCAN(min_cluster_size=self.min_cluster_size, metric="euclidean")
                 labels = clusterer.fit_predict(self._embeddings)
@@ -593,14 +798,14 @@ class FailureClusteringEngine:
                 clusterer = DBSCAN(eps=self.eps, min_samples=self.min_cluster_size, metric="cosine")
                 labels = clusterer.fit_predict(self._embeddings)
         else:
-            clusterer = DBSCAN(eps=self.eps, min_samples=2, metric="cosine")
+            clusterer = DBSCAN(eps=self.eps, min_samples=self.min_cluster_size, metric="cosine")
             labels = clusterer.fit_predict(self._embeddings)
 
         # Group failures by cluster
         cluster_groups: dict[int, list[tuple[int, FailureInstance]]] = defaultdict(list)
-        for i, (label, failure) in enumerate(zip(labels, self._get_all_failures())):
+        for i, (label, embedded_failure) in enumerate(zip(labels, embedded_failures)):
             if label >= 0:  # -1 is noise
-                cluster_groups[int(label)].append((i, failure))
+                cluster_groups[int(label)].append((i, embedded_failure.failure))
 
         # Build FailureCluster objects
         self.clusters = []
@@ -613,8 +818,12 @@ class FailureClusteringEngine:
 
     def _get_all_failures(self) -> list[FailureInstance]:
         """Get all failure instances that were added."""
-        # This is a simplified version - in practice you'd maintain a proper mapping
-        return []
+        return [item.failure for item in self._embedded_failures]
+
+    def _embed_failure(self, failure: FailureInstance) -> EmbeddedFailure:
+        """Create the embedding text and keep it attached to the source failure."""
+        text = f"Task: {failure.task_id}. Failure: {failure.description}. Error: {failure.error_message}"
+        return EmbeddedFailure(failure=failure, embedding_text=text)
 
     def _build_cluster(self, cluster_id: int, failures: list[FailureInstance], indices: list[int]) -> FailureCluster:
         """Build a FailureCluster from grouped failures."""
@@ -739,8 +948,8 @@ class FailureClusteringEngine:
         new_clusters = []
         resolved_clusters = []
 
-        current_trace_sets = {c.cluster_id: set(f.trace_id for f in c.failures) for c in self.clusters}
-        previous_trace_sets = {c.cluster_id: set(f.trace_id for f in c.failures) for c in previous_clusters}
+        current_trace_sets = {c.cluster_id: self._cluster_trace_ids(c) for c in self.clusters}
+        previous_trace_sets = {c.cluster_id: self._cluster_trace_ids(c) for c in previous_clusters}
 
         # Find matches
         for curr_id, curr_traces in current_trace_sets.items():
@@ -783,6 +992,10 @@ class FailureClusteringEngine:
             "total_current": len(self.clusters),
             "total_previous": len(previous_clusters),
         }
+
+    def _cluster_trace_ids(self, cluster: FailureCluster) -> set[str]:
+        """Return only real trace IDs; missing IDs cannot establish cluster continuity."""
+        return {f.trace_id for f in cluster.failures if f.trace_id is not None}
 
 
 # -----------------------------------------------------------------------------
@@ -966,12 +1179,20 @@ class FailureAnalysisPipeline:
         clusterer: FailureClusteringEngine | None = None,
         rca_engine: RootCauseAnalyzer | None = None,
     ):
-        self.diagnoser = diagnoser or LLMJudgeDiagnoser()
+        if diagnoser is None:
+            raise ValueError(
+                "FailureAnalysisPipeline requires an explicit diagnoser. "
+                "Use LLMJudgeDiagnoser(judge_fn=...) for runtime analysis or "
+                "LLMJudgeDiagnoser(use_mock_judge=True) for tests/demos."
+            )
+        self.diagnoser = diagnoser
         self.clusterer = clusterer or FailureClusteringEngine()
         self.rca_engine = rca_engine or RootCauseAnalyzer()
 
         self.all_failures: list[FailureInstance] = []
+        self.diagnosis_errors: list[DiagnosisError] = []
         self.previous_clusters: list[FailureCluster] | None = None
+        self._clustering_has_run = False
 
     def process_traces(self, traces: list[dict[str, Any]]) -> list[FailureInstance]:
         """
@@ -986,19 +1207,26 @@ class FailureAnalysisPipeline:
         all_failures = []
 
         for trace in traces:
-            failures = self.diagnoser.diagnose(trace)
-            all_failures.extend(failures)
+            result = self.diagnoser.diagnose(trace)
+            if isinstance(result, DiagnosedFailures):
+                all_failures.extend(result.failures)
+            else:
+                self.diagnosis_errors.append(result)
 
         self.all_failures.extend(all_failures)
         return all_failures
 
     def run_clustering(self) -> list[FailureCluster]:
         """Cluster all diagnosed failures."""
-        self.clusterer.add_failures(self.all_failures)
-        return self.clusterer.cluster()
+        clusters = self.clusterer.cluster(self.all_failures)
+        self._clustering_has_run = True
+        return clusters
 
     def generate_report(self) -> dict[str, Any]:
         """Generate comprehensive failure analysis report."""
+        if self.all_failures and not self._clustering_has_run:
+            raise RuntimeError("run_clustering() must be called before generate_report().")
+
         clusters = self.clusterer.clusters
 
         # Run RCA on each cluster
@@ -1019,6 +1247,7 @@ class FailureAnalysisPipeline:
         return {
             "summary": {
                 "total_failures_diagnosed": len(self.all_failures),
+                "diagnosis_errors": len(self.diagnosis_errors),
                 "clusters_identified": len(clusters),
                 "category_distribution": dict(category_distribution),
                 "severity_distribution": dict(severity_distribution),
@@ -1049,21 +1278,96 @@ class FailureAnalysisPipeline:
     def save_state(self, filepath: str) -> None:
         """Save the current analysis state to disk."""
         state = {
+            "schema_version": ANALYSIS_STATE_SCHEMA_VERSION,
             "failures": [f.to_dict() for f in self.all_failures],
-            "clusters": [c.to_dict() for c in self.clusterer.clusters],
-            "timestamp": datetime.utcnow().isoformat(),
+            "clusters": [self._cluster_to_state_dict(c) for c in self.clusterer.clusters],
+            "diagnosis_errors": [error.to_dict() for error in self.diagnosis_errors],
+            "timestamp": utc_now().isoformat(),
         }
-        Path(filepath).parent.mkdir(parents=True, exist_ok=True)
-        with open(filepath, "w") as f:
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = path.with_name(f".{path.name}.tmp")
+        with open(temp_path, "w") as f:
             json.dump(state, f, indent=2, default=str)
+            f.flush()
+            os.fsync(f.fileno())
+        temp_path.replace(path)
 
     def load_state(self, filepath: str) -> None:
         """Load a previous analysis state."""
         with open(filepath) as f:
             state = json.load(f)
 
-        # Store previous clusters for comparison
-        self.previous_clusters = self.clusterer.clusters
+        if state.get("schema_version") not in (None, ANALYSIS_STATE_SCHEMA_VERSION):
+            raise ValueError(f"Unsupported analysis state schema_version: {state.get('schema_version')}")
 
-        # Note: Full reconstruction of FailureInstance objects would go here
-        # For now, we just note that state was loaded
+        self.all_failures = [
+            FailureInstance.from_dict(failure_data)
+            for failure_data in state.get("failures", [])
+        ]
+        failure_lookup = {failure.failure_id: failure for failure in self.all_failures}
+
+        loaded_clusters = [
+            self._cluster_from_state_dict(cluster_data, failure_lookup)
+            for cluster_data in state.get("clusters", [])
+        ]
+        self.clusterer.clusters = loaded_clusters
+        self.previous_clusters = loaded_clusters
+        self._clustering_has_run = True
+        self.diagnosis_errors = [
+            self._diagnosis_error_from_state_dict(error_data)
+            for error_data in state.get("diagnosis_errors", [])
+        ]
+
+    def _cluster_to_state_dict(self, cluster: FailureCluster) -> dict[str, Any]:
+        state = cluster.to_dict()
+        state["failure_ids"] = [failure.failure_id for failure in cluster.failures]
+        return state
+
+    def _cluster_from_state_dict(
+        self,
+        data: dict[str, Any],
+        failure_lookup: dict[str, FailureInstance],
+    ) -> FailureCluster:
+        failure_ids = data.get("failure_ids", [])
+        failures = [
+            failure_lookup[failure_id]
+            for failure_id in failure_ids
+            if failure_id in failure_lookup
+        ]
+
+        return FailureCluster(
+            cluster_id=int(data.get("cluster_id", 0)),
+            label=str(data.get("label", "Unknown Failure Pattern")),
+            description=str(data.get("description", "")),
+            failures=failures,
+            dominant_category=data.get("dominant_category"),
+            dominant_subcategory=data.get("dominant_subcategory"),
+            affected_agents=set(data.get("affected_agents", [])),
+            affected_models=set(data.get("affected_models", [])),
+            common_keywords=list(data.get("common_keywords", [])),
+            common_tool_calls=list(data.get("common_tool_calls", [])),
+            avg_severity=str(data.get("avg_severity", "medium")),
+            suggested_prompt_fix=str(data.get("suggested_prompt_fix", "")),
+            suggested_tool_fix=str(data.get("suggested_tool_fix", "")),
+            regression_tests_needed=list(data.get("regression_tests_needed", [])),
+        )
+
+    def _diagnosis_error_from_state_dict(self, data: dict[str, Any]) -> DiagnosisError:
+        error_type = data.get("type")
+        if error_type == "infrastructure_error":
+            return DiagnosisInfrastructureError(
+                trace_id=data.get("trace_id"),
+                task_id=str(data.get("task_id", "unknown")),
+                agent_name=str(data.get("agent_name", "unknown")),
+                message=str(data.get("message", "")),
+                exception_type=str(data.get("exception_type", "Exception")),
+            )
+
+        return DiagnosisInvalidResponse(
+            trace_id=data.get("trace_id"),
+            task_id=str(data.get("task_id", "unknown")),
+            agent_name=str(data.get("agent_name", "unknown")),
+            message=str(data.get("message", "")),
+            response_excerpt=str(data.get("response_excerpt", "")),
+        )

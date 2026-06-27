@@ -2,6 +2,8 @@ import http.client
 import json
 import threading
 
+from agent_quality.adapters.codex_hooks import ingest_hook_event
+from agent_quality.collector.envelope import make_envelope, normalize_envelope
 from agent_quality.collector.server import CollectorHandler, CollectorServer
 from agent_quality.db import all_rows, connect, insert, one
 
@@ -205,6 +207,135 @@ def test_collector_log_endpoint_only_reads_known_paths(tmp_path, monkeypatch):
         conn_http.request("GET", f"/v1/ui/api/log?path={tmp_path / 'other.txt'}")
         response = conn_http.getresponse()
         assert response.status == 403
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_dashboard_details_backfills_hook_output_and_linked_artifacts(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_QUALITY_HOME", str(tmp_path / "aq"))
+    db_path = tmp_path / "quality.sqlite3"
+    linked = tmp_path / "linked.py"
+    linked.write_text("print('linked')\n", encoding="utf-8")
+    prompt_event_id = ingest_hook_event(
+        "UserPromptSubmit",
+        {
+            "event_id": "evt_dashboard_prompt",
+            "session_id": "ses_dashboard",
+            "prompt": "inspect output",
+            "timestamp": "2026-01-01T00:00:00.000Z",
+        },
+        db_path=db_path,
+    )
+    run_id = one(connect(db_path), "SELECT run_id FROM events WHERE id=?", [prompt_event_id])["run_id"]
+    stop = normalize_envelope(
+        make_envelope(
+            event_type="agent.hook.stop",
+            source_event_type="Stop",
+            session_id="ses_dashboard",
+            run_id=None,
+            data={"status": "observed", "item_type": "lifecycle", "hook_event": "Stop"},
+            extensions={
+                "openai.codex.hook": {
+                    "session_id": "ses_dashboard",
+                    "last_assistant_message": f"Updated [linked.py]({linked}:1).",
+                    "transcript_path": str(tmp_path / "transcript.jsonl"),
+                }
+            },
+        )
+    )
+    with connect(db_path) as conn:
+        insert(conn, "events", stop)
+
+    server = CollectorServer(("127.0.0.1", 0), CollectorHandler, db_path=db_path, bearer_token=None)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        conn_http = _connection(server)
+        conn_http.request("GET", f"/v1/ui/api/run/{run_id}")
+        response = conn_http.getresponse()
+        details = json.loads(response.read())
+
+        assert response.status == 200
+        assert details["agent_outputs"][0]["text"] == f"Updated [linked.py]({linked}:1)."
+        assert any(artifact["path"] == str(linked) for artifact in details["artifacts"])
+        assert one(connect(db_path), "SELECT run_id FROM events WHERE id=?", [stop["id"]])["run_id"] == run_id
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_dashboard_details_separates_reasoning_and_tool_calls(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_QUALITY_HOME", str(tmp_path / "aq"))
+    db_path = tmp_path / "quality.sqlite3"
+    with connect(db_path) as conn:
+        _insert_run(conn, "run_trace", "not_reviewed", "2026-01-01T00:00:00.000Z")
+        reasoning = make_envelope(
+            event_type="agent.reasoning",
+            source_event_type="transcript.commentary",
+            run_id="run_trace",
+            data={
+                "status": "completed",
+                "item_type": "reasoning",
+                "reasoning": "Inspect the event adapter.",
+                "reasoning_kind": "commentary",
+            },
+        )
+        reasoning["occurred_at"] = "2026-01-01T00:00:01.000Z"
+        insert(conn, "events", normalize_envelope(reasoning))
+        insert(
+            conn,
+            "events",
+            normalize_envelope(
+                make_envelope(
+                    event_type="agent.tool.started",
+                    source_event_type="PreToolUse",
+                    run_id="run_trace",
+                    data={
+                        "status": "started",
+                        "item_type": "mcp_tool_call",
+                        "tool_category": "mcp",
+                        "tool_name": "mcp__quorum__consult_council",
+                        "tool_call_id": "call_1",
+                        "tool_input": {"question": "Review this"},
+                    },
+                )
+            ),
+        )
+        insert(
+            conn,
+            "events",
+            normalize_envelope(
+                make_envelope(
+                    event_type="agent.tool.completed",
+                    source_event_type="PostToolUse",
+                    run_id="run_trace",
+                    data={
+                        "status": "success",
+                        "item_type": "mcp_tool_call",
+                        "tool_category": "mcp",
+                        "tool_name": "mcp__quorum__consult_council",
+                        "tool_call_id": "call_1",
+                        "tool_output": "No defects.",
+                    },
+                )
+            ),
+        )
+
+    server = CollectorServer(("127.0.0.1", 0), CollectorHandler, db_path=db_path, bearer_token=None)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        conn_http = _connection(server)
+        conn_http.request("GET", "/v1/ui/api/run/run_trace")
+        response = conn_http.getresponse()
+        details = json.loads(response.read())
+
+        assert response.status == 200
+        assert details["reasoning_trace"][0]["text"] == "Inspect the event adapter."
+        assert details["tool_calls"][0]["tool_name"] == "mcp__quorum__consult_council"
+        assert details["tool_calls"][0]["input"] == {"question": "Review this"}
+        assert details["tool_calls"][0]["output"] == "No defects."
     finally:
         server.shutdown()
         server.server_close()

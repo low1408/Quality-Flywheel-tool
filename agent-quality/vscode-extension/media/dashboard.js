@@ -110,7 +110,7 @@
       state.activeTab = target.dataset.tab || "overview";
       renderDetail();
     } else if (action === "openPath") {
-      openPath(target.dataset.path);
+      openPath(target.dataset.path, target.dataset.line);
     } else if (action === "openDiff") {
       openDiff();
     } else if (action === "selectEvent") {
@@ -209,14 +209,18 @@
     }
     elements.runList.innerHTML = filtered.map((run) => {
       const active = run.id === state.selectedRunId ? " is-active" : "";
-      const prompt = run.prompt ? ` - ${compact(run.prompt, 82)}` : "";
+      const prompt = summaryText(run.prompt, 96, "No prompt captured");
+      const meta = [
+        run.started_at ? formatDate(run.started_at) : "",
+        run.model || ""
+      ].filter(Boolean).join(" - ");
       return `
         <button type="button" class="run-card${active}" data-action="selectRun" data-run-id="${escapeAttr(run.id)}">
           <span class="run-card-main">
-            <span class="run-id">${escapeHtml(run.id)}</span>
+            <span class="run-title">${escapeHtml(prompt)}</span>
             ${statusChip(run.verifier_status || "unverified")}
           </span>
-          <span class="run-meta">${escapeHtml(formatDate(run.started_at))}${escapeHtml(prompt)}</span>
+          ${meta ? `<span class="run-meta">${escapeHtml(meta)}</span>` : ""}
           <span class="status-row">
             ${statusChip(run.agent_status || "agent_unknown")}
             ${statusChip(run.human_status || "not_reviewed")}
@@ -269,11 +273,12 @@
       return;
     }
     const run = details.run;
+    const selectedTabId = `run-tab-${state.activeTab}`;
     elements.detailPane.innerHTML = `
       <div class="detail-layout">
         <div class="detail-head">
           <div class="detail-title">
-            <h2>${escapeHtml(run.id)}</h2>
+            <h2>${escapeHtml(summaryText(run.prompt, 104, "Run details"))}</h2>
             <p>${escapeHtml(run.repository_path || "n/a")}</p>
             <div class="status-row">
               ${statusChip(run.agent_status || "agent_unknown")}
@@ -287,12 +292,21 @@
             <button type="button" class="button primary" data-action="setTab" data-tab="review">Review</button>
           </div>
         </div>
-        <div class="tabs" role="tablist">
+        <div class="tabs" role="tablist" aria-label="Run views">
           ${tabs.map(([id, label]) => `
-            <button type="button" class="tab-button${state.activeTab === id ? " is-active" : ""}" data-action="setTab" data-tab="${id}">${label}</button>
+            <button
+              type="button"
+              id="run-tab-${id}"
+              class="tab-button${state.activeTab === id ? " is-active" : ""}"
+              role="tab"
+              aria-selected="${state.activeTab === id}"
+              aria-controls="run-tab-panel"
+              data-action="setTab"
+              data-tab="${id}"
+            >${label}</button>
           `).join("")}
         </div>
-        <div class="content-panel">
+        <div id="run-tab-panel" class="content-panel" role="tabpanel" aria-labelledby="${selectedTabId}">
           ${renderActiveTab(details)}
         </div>
       </div>
@@ -312,33 +326,51 @@
     if (state.activeTab === "review") {
       return renderReview(details);
     }
-    return renderOverview(details.run);
+    return renderOverview(details);
   }
 
-  function renderOverview(run) {
+  function renderOverview(details) {
+    const run = details.run;
+    const outputs = details.agent_outputs || [];
+    const latestOutput = outputs.length ? outputs[outputs.length - 1] : null;
+    const reasoningTrace = details.reasoning_trace || [];
+    const toolCalls = details.tool_calls || [];
     return `
-      <div class="stack">
-        <div class="overview-grid">
-          ${kv("Started", formatDate(run.started_at))}
-          ${kv("Completed", formatDate(run.completed_at))}
-          ${kv("Duration", formatDuration(run.duration_ms))}
-          ${kv("Model", value(run.model))}
-          ${kv("Agent", value(run.agent_adapter))}
-          ${kv("Turn", value(run.turn_number))}
-          ${kv("Base commit", value(run.base_commit))}
-          ${kv("Resulting commit", value(run.resulting_commit))}
-          ${kv("Session", value(run.session_id))}
+      <div class="overview-stack">
+        <div class="overview-primary">
+          <section class="reading-section" aria-labelledby="prompt-heading">
+            <h3 id="prompt-heading" class="section-title">Prompt</h3>
+            <pre class="prompt-block reading-content">${escapeHtml(run.prompt || "No prompt captured.")}</pre>
+          </section>
+          <section class="reading-section" aria-labelledby="output-heading">
+            <h3 id="output-heading" class="section-title">Agent output</h3>
+            ${latestOutput ? outputBlock(latestOutput) : '<div class="empty-copy reading-empty">No agent output captured yet.</div>'}
+          </section>
+          <section class="reading-section" aria-labelledby="reasoning-heading">
+            <h3 id="reasoning-heading" class="section-title">Reasoning trace</h3>
+            <p class="section-note">Shows emitted commentary and reasoning summaries. Private chain-of-thought remains encrypted by Codex and is not available to the collector.</p>
+            ${reasoningTraceBlock(reasoningTrace)}
+          </section>
+          <section class="reading-section" aria-labelledby="tools-heading">
+            <h3 id="tools-heading" class="section-title">Tool calls</h3>
+            ${toolCallsBlock(toolCalls)}
+          </section>
         </div>
-        <div class="metric-grid">
-          ${kv("Input tokens", value(run.input_tokens))}
-          ${kv("Cached input", value(run.cached_input_tokens))}
-          ${kv("Output tokens", value(run.output_tokens))}
-          ${kv("Verifier version", value(run.verifier_version))}
-        </div>
-        <div>
-          <h3 class="section-title">Prompt</h3>
-          <pre class="prompt-block">${escapeHtml(run.prompt || "n/a")}</pre>
-        </div>
+        <details class="overview-secondary">
+          <summary>Run details</summary>
+          <div class="overview-grid">
+            ${kv("Started", formatDate(run.started_at))}
+            ${kv("Completed", formatDate(run.completed_at))}
+            ${kv("Duration", formatDuration(run.duration_ms))}
+            ${kv("Model", value(run.model))}
+            ${kv("Agent", value(run.agent_adapter))}
+            ${kv("Turn", value(run.turn_number))}
+            ${kv("Base commit", value(run.base_commit))}
+            ${kv("Resulting commit", value(run.resulting_commit))}
+            ${kv("Session", value(run.session_id))}
+            ${kv("Verifier version", value(run.verifier_version))}
+          </div>
+        </details>
       </div>
     `;
   }
@@ -387,7 +419,7 @@
                 <div class="path-text">${escapeHtml(artifact.path || "n/a")}</div>
               </div>
               <div class="record-actions">
-                ${pathButton(vscode ? "Open File" : "Preview", artifact.path)}
+                ${pathButton(vscode ? "Open File" : "Preview", artifact.path, artifact.line)}
               </div>
             </div>
             <div class="status-row">
@@ -422,7 +454,10 @@
             </button>
           `).join("")}
         </div>
-        <pre class="json-block">${escapeHtml(JSON.stringify(selectedEventPayload(selected), null, 2))}</pre>
+        <div class="event-detail">
+          ${eventSummary(selected)}
+          <pre class="json-block">${escapeHtml(JSON.stringify(selectedEventPayload(selected), null, 2))}</pre>
+        </div>
       </div>
     `;
   }
@@ -506,12 +541,12 @@
     }
   }
 
-  async function openPath(filePath) {
+  async function openPath(filePath, line) {
     if (!filePath) {
       return;
     }
     if (vscode) {
-      await request("openFile", { path: filePath });
+      await request("openFile", { path: filePath, line });
       return;
     }
     await previewPath(filePath);
@@ -609,11 +644,130 @@
     `;
   }
 
-  function pathButton(label, filePath) {
+  function pathButton(label, filePath, line) {
     if (!filePath) {
       return "";
     }
-    return `<button type="button" class="button ghost" data-action="openPath" data-path="${escapeAttr(filePath)}">${escapeHtml(label)}</button>`;
+    const lineAttr = line ? ` data-line="${escapeAttr(line)}"` : "";
+    return `<button type="button" class="button ghost" data-action="openPath" data-path="${escapeAttr(filePath)}"${lineAttr}>${escapeHtml(label)}</button>`;
+  }
+
+  function outputBlock(output) {
+    const occurredAt = output.occurred_at ? formatDate(output.occurred_at) : "";
+    return `
+      <div class="output-block">
+        ${occurredAt ? `<div class="output-meta">Latest response - ${escapeHtml(occurredAt)}</div>` : ""}
+        <pre class="prompt-block reading-content">${escapeHtml(output.text || "")}</pre>
+        ${fileLinksBlock(output.file_links || [])}
+      </div>
+    `;
+  }
+
+  function reasoningTraceBlock(trace) {
+    if (!trace.length) {
+      return '<div class="empty-copy trace-empty">No emitted reasoning summaries or commentary captured.</div>';
+    }
+    return `
+      <div class="trace-list">
+        ${trace.map((entry) => `
+          <article class="trace-entry reasoning-entry">
+            <div class="trace-head">
+              <span class="trace-kind">${escapeHtml(humanize(entry.kind || "reasoning"))}</span>
+              ${entry.occurred_at ? `<time>${escapeHtml(formatDate(entry.occurred_at))}</time>` : ""}
+            </div>
+            <pre class="trace-content">${escapeHtml(entry.text || "")}</pre>
+          </article>
+        `).join("")}
+      </div>
+    `;
+  }
+
+  function toolCallsBlock(calls) {
+    if (!calls.length) {
+      return '<div class="empty-copy trace-empty">No tool calls captured.</div>';
+    }
+    return `
+      <div class="trace-list">
+        ${calls.map((call) => `
+          <details class="trace-entry tool-entry">
+            <summary>
+              <span class="tool-name">${escapeHtml(call.tool_name || "tool")}</span>
+              <span class="status-row">
+                ${call.tool_category ? statusChip(call.tool_category) : ""}
+                ${statusChip(call.status || "observed")}
+              </span>
+            </summary>
+            <div class="tool-detail">
+              ${call.occurred_at ? `<div class="output-meta">${escapeHtml(formatDate(call.occurred_at))}</div>` : ""}
+              ${traceValue("Input", call.input)}
+              ${traceValue("Output", call.output)}
+            </div>
+          </details>
+        `).join("")}
+      </div>
+    `;
+  }
+
+  function traceValue(label, data) {
+    if (data === null || data === undefined || data === "") {
+      return "";
+    }
+    const text = typeof data === "string" ? data : JSON.stringify(data, null, 2);
+    return `
+      <div>
+        <div class="trace-label">${escapeHtml(label)}</div>
+        <pre class="trace-content">${escapeHtml(compact(text, 12000))}</pre>
+      </div>
+    `;
+  }
+
+  function eventSummary(event) {
+    const payload = event.normalized_payload_json || {};
+    const assistantOutput = payload.assistant_output || event.assistant_output;
+    const toolOutput = payload.tool_output || event.tool_output;
+    const links = payload.file_links || event.file_links || [];
+    const artifacts = payload.artifacts || [];
+    const parts = [];
+    if (assistantOutput) {
+      parts.push(`
+        <div>
+          <h3 class="section-title">Assistant Output</h3>
+          <pre class="prompt-block">${escapeHtml(assistantOutput)}</pre>
+        </div>
+      `);
+    }
+    if (toolOutput) {
+      parts.push(`
+        <div>
+          <h3 class="section-title">Tool Output</h3>
+          <pre class="prompt-block">${escapeHtml(compact(toolOutput, 6000))}</pre>
+        </div>
+      `);
+    }
+    const combinedLinks = [
+      ...links,
+      ...artifacts.map((artifact) => ({ path: artifact.path, label: artifact.artifact_type }))
+    ].filter((item) => item && item.path);
+    if (combinedLinks.length) {
+      parts.push(fileLinksBlock(combinedLinks));
+    }
+    return parts.length ? `<div class="event-summary">${parts.join("")}</div>` : "";
+  }
+
+  function fileLinksBlock(links) {
+    if (!Array.isArray(links) || !links.length) {
+      return "";
+    }
+    return `
+      <div class="link-list">
+        ${links.map((link) => `
+          <div class="link-row">
+            <span class="path-text">${escapeHtml(link.label || link.path)}${link.line ? `:${escapeHtml(link.line)}` : ""}</span>
+            ${pathButton(vscode ? "Open File" : "Preview", link.path, link.line)}
+          </div>
+        `).join("")}
+      </div>
+    `;
   }
 
   function selectField(label, name, options, selected) {
@@ -634,8 +788,8 @@
   }
 
   function statusChip(value) {
-    const label = String(value || "n/a");
-    return `<span class="chip ${statusClass(label)}">${escapeHtml(label)}</span>`;
+    const rawValue = String(value || "n/a");
+    return `<span class="chip ${statusClass(rawValue)}">${escapeHtml(humanize(rawValue))}</span>`;
   }
 
   function statusClass(value) {
@@ -709,6 +863,16 @@
       return value;
     }
     return `${value.slice(0, Math.max(0, maxLength - 3))}...`;
+  }
+
+  function summaryText(input, maxLength, fallback) {
+    const value = String(input || "").replace(/\s+/g, " ").trim();
+    return compact(value || fallback, maxLength);
+  }
+
+  function humanize(input) {
+    const value = String(input || "").replace(/_/g, " ");
+    return value ? value[0].toUpperCase() + value.slice(1) : "";
   }
 
   function formatDate(input) {

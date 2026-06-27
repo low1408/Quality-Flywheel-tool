@@ -55,7 +55,8 @@ async function initProject() {
   if (!folder) {
     return;
   }
-  await runAq(["init", "--repo", folder.uri.fsPath], folder, { title: "Initialize project" });
+  const repo = projectRootPath(folder);
+  await runAq(["init", "--repo", repo], folder, { title: "Initialize project" });
   runsProvider.refresh();
 }
 
@@ -95,7 +96,7 @@ async function runSelection() {
 
 async function runMeasuredPrompt(folder, prompt) {
   const cfg = getConfig();
-  const args = ["run", "--repo", folder.uri.fsPath];
+  const args = ["run", "--repo", projectRootPath(folder)];
   const verifyPath = configuredVerifyPath(folder);
   if (verifyPath) {
     args.push("--verify", verifyPath);
@@ -119,7 +120,7 @@ async function installCodexHooks() {
     return;
   }
   const pythonPath = getConfig().get("pythonPath") || "python3";
-  await runAq(["install-codex-hooks", "--repo", folder.uri.fsPath, "--python", pythonPath], folder, {
+  await runAq(["install-codex-hooks", "--repo", projectRootPath(folder), "--python", pythonPath], folder, {
     title: "Install Codex hooks"
   });
 }
@@ -151,7 +152,7 @@ async function startCollector() {
   output.show(true);
   output.appendLine(`$ ${quoteArgs([...invocation.commandLine, ...args])}`);
   collectorProcess = cp.spawn(invocation.command, [...invocation.prefixArgs, ...args], {
-    cwd: folder.uri.fsPath,
+    cwd: projectRootPath(folder),
     env: commandEnv(folder),
     shell: false
   });
@@ -209,7 +210,7 @@ async function runAq(args, folder, options) {
 
   return new Promise((resolve) => {
     const child = cp.spawn(invocation.command, [...invocation.prefixArgs, ...args], {
-      cwd: folder.uri.fsPath,
+      cwd: projectRootPath(folder),
       env: commandEnv(folder),
       shell: false
     });
@@ -356,8 +357,10 @@ const MAX_FILE_PREVIEW_BYTES = 1_000_000;
 
 const DASHBOARD_DB_SCRIPT = String.raw`
 import datetime
+import hashlib
 import json
 import os
+import re
 import sqlite3
 import sys
 import uuid
@@ -400,17 +403,384 @@ def utc_now():
     return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
+def sha256_text(value):
+    return hashlib.sha256(str(value).encode("utf-8")).hexdigest()
+
+
+MARKDOWN_FILE_LINK_RE = re.compile(r"\[[^\]]+\]\((/[^)\n]+?)(?::(\d+))?\)")
+
+
+def assistant_output(event_name, hook):
+    if event_name not in ("Stop", "AssistantMessage", "AgentMessage") or not isinstance(hook, dict):
+        return None
+    for key in (
+        "last_assistant_message",
+        "assistant_message",
+        "assistantMessage",
+        "assistant_output",
+        "assistantOutput",
+        "final_response",
+        "finalResponse",
+        "response",
+        "output",
+        "message",
+        "text",
+        "content",
+    ):
+        value = hook.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def file_links(hook, text=None):
+    links = []
+    seen = set()
+
+    def add(path, line=None, label=None):
+        if not isinstance(path, str):
+            return
+        path = strip_line_suffix(path.strip())
+        if not path.startswith("/"):
+            return
+        key = (path, line)
+        if key in seen:
+            return
+        seen.add(key)
+        item = {"path": path}
+        if line is not None:
+            item["line"] = line
+        if label:
+            item["label"] = label
+        links.append(item)
+
+    for value in (text, hook.get("prompt") if isinstance(hook, dict) else None):
+        if not isinstance(value, str):
+            continue
+        for match in MARKDOWN_FILE_LINK_RE.finditer(value):
+            add(match.group(1), int(match.group(2)) if match.group(2) else None)
+    if isinstance(hook, dict):
+        for key in ("path", "file", "file_path", "filePath"):
+            add(hook.get(key))
+        for key in ("files", "file_paths", "filePaths"):
+            values = hook.get(key)
+            if isinstance(values, list):
+                for value in values:
+                    if isinstance(value, str):
+                        add(value)
+                    elif isinstance(value, dict):
+                        add(value.get("path") or value.get("file"), value.get("line") or value.get("line_number"))
+    return links
+
+
+def hook_artifacts(hook):
+    artifacts = []
+    seen = set()
+
+    def add(path, artifact_type):
+        if not isinstance(path, str):
+            return
+        path = strip_line_suffix(path.strip())
+        if not path.startswith("/") or path in seen:
+            return
+        seen.add(path)
+        artifacts.append({"artifact_type": artifact_type, "path": path})
+
+    if isinstance(hook, dict):
+        add(hook.get("transcript_path") or hook.get("transcriptPath"), "transcript")
+        for key in ("artifact_path", "artifactPath", "log_path", "logPath"):
+            add(hook.get(key), "hook_artifact")
+        values = hook.get("artifacts") or hook.get("artifact_paths") or hook.get("artifactPaths")
+        if isinstance(values, list):
+            for value in values:
+                if isinstance(value, str):
+                    add(value, "hook_artifact")
+                elif isinstance(value, dict):
+                    add(value.get("path") or value.get("file"), value.get("artifact_type") or value.get("type") or "hook_artifact")
+    return artifacts
+
+
+def strip_line_suffix(path):
+    if not isinstance(path, str) or ":" not in path:
+        return path
+    prefix, suffix = path.rsplit(":", 1)
+    return prefix if suffix.isdigit() else path
+
+
+def hook_payload(row):
+    extensions = json_or_value(row["provider_extensions"])
+    if not isinstance(extensions, dict):
+        return None
+    hook = extensions.get("openai.codex.hook")
+    return hook if isinstance(hook, dict) else None
+
+
+def event_artifact_items(row):
+    items = []
+    payload = json_or_value(row["normalized_payload"])
+    if isinstance(payload, dict):
+        if isinstance(payload.get("path"), str) and payload.get("path"):
+            items.append({"artifact_type": "event_path", "path": payload["path"]})
+        for link in payload.get("file_links") or []:
+            if isinstance(link, dict) and isinstance(link.get("path"), str):
+                item = {"artifact_type": "linked_file"}
+                item.update(link)
+                items.append(item)
+        for artifact in payload.get("artifacts") or []:
+            if isinstance(artifact, dict) and isinstance(artifact.get("path"), str):
+                items.append(artifact)
+    hook = hook_payload(row)
+    if hook:
+        items.extend(hook_artifacts(hook))
+        output = assistant_output(row["source_event_type"], hook)
+        for link in file_links(hook, output):
+            item = {"artifact_type": "linked_file"}
+            item.update(link)
+            items.append(item)
+    return items
+
+
+def event_artifacts(conn, run_id):
+    artifacts = []
+    seen = set()
+    for row in conn.execute("SELECT * FROM events WHERE run_id=? ORDER BY rowid", [run_id]).fetchall():
+        for item in event_artifact_items(row):
+            path = item.get("path")
+            if not isinstance(path, str) or not path or path in seen:
+                continue
+            seen.add(path)
+            size = os.path.getsize(path) if os.path.isfile(path) else None
+            artifacts.append({
+                "id": "event_artifact_" + sha256_text(path)[:16],
+                "run_id": run_id,
+                "artifact_type": item.get("artifact_type") or "linked_file",
+                "path": path,
+                "line": item.get("line"),
+                "sha256": None,
+                "size_bytes": size,
+            })
+    return artifacts
+
+
+def agent_outputs(conn, run_id):
+    outputs = []
+    rows = conn.execute(
+        "SELECT * FROM events WHERE run_id=? ORDER BY COALESCE(sequence_number, rowid), rowid",
+        [run_id],
+    ).fetchall()
+    for row in rows:
+        payload = json_or_value(row["normalized_payload"])
+        hook = hook_payload(row)
+        text = None
+        links = []
+        if isinstance(payload, dict):
+            text = payload.get("assistant_output")
+            links = payload.get("file_links") if isinstance(payload.get("file_links"), list) else []
+        if not text and hook:
+            text = assistant_output(row["source_event_type"], hook)
+            links = file_links(hook, text)
+        if text:
+            outputs.append({
+                "event_id": row["id"],
+                "sequence_number": row["sequence_number"],
+                "occurred_at": row["occurred_at"] or row["observed_at"],
+                "text": str(text),
+                "file_links": links,
+            })
+    return outputs
+
+
+def reasoning_trace(conn, run_id):
+    trace = []
+    rows = conn.execute(
+        "SELECT * FROM events WHERE run_id=? ORDER BY COALESCE(occurred_at, observed_at), rowid",
+        [run_id],
+    ).fetchall()
+    for row in rows:
+        event_payload = json_or_value(row["normalized_payload"])
+        if not isinstance(event_payload, dict) or not event_payload.get("reasoning"):
+            continue
+        trace.append({
+            "event_id": row["id"],
+            "occurred_at": row["occurred_at"] or row["observed_at"],
+            "kind": event_payload.get("reasoning_kind") or "summary",
+            "text": str(event_payload["reasoning"]),
+        })
+    return trace
+
+
+def tool_calls(conn, run_id):
+    calls = []
+    by_id = {}
+    rows = conn.execute(
+        "SELECT * FROM events WHERE run_id=? ORDER BY COALESCE(sequence_number, rowid), rowid",
+        [run_id],
+    ).fetchall()
+    for row in rows:
+        event_payload = json_or_value(row["normalized_payload"])
+        event_payload = event_payload if isinstance(event_payload, dict) else {}
+        hook = hook_payload(row) or {}
+        source_type = str(row["source_event_type"] or "")
+        is_started = source_type == "PreToolUse" or row["event_type"] == "agent.tool.started"
+        is_completed = source_type == "PostToolUse" or row["event_type"] == "agent.tool.completed"
+        if not is_started and not is_completed:
+            continue
+        call_id = event_payload.get("tool_call_id") or hook.get("tool_use_id") or hook.get("call_id")
+        tool_name = event_payload.get("tool_name") or hook.get("tool_name") or hook.get("toolName")
+        tool_category = row["tool_category"] or event_payload.get("tool_category")
+        if isinstance(tool_name, str) and tool_name.lower().startswith("mcp__"):
+            tool_category = "mcp"
+        key = str(call_id) if call_id else str(tool_name) + ":" + str(row["id"])
+        call = by_id.get(key)
+        if call is None:
+            call = {
+                "event_id": row["id"],
+                "call_id": call_id,
+                "occurred_at": row["occurred_at"] or row["observed_at"],
+                "tool_name": tool_name or row["tool_category"] or "tool",
+                "tool_category": tool_category,
+                "status": row["status"],
+                "input": event_payload.get("tool_input", hook.get("tool_input", hook.get("toolInput"))),
+                "output": None,
+            }
+            by_id[key] = call
+            calls.append(call)
+        elif call.get("input") is None:
+            call["input"] = event_payload.get("tool_input", hook.get("tool_input", hook.get("toolInput")))
+        if is_completed:
+            call["status"] = row["status"] or "completed"
+            call["output"] = event_payload.get(
+                "tool_output",
+                hook.get("tool_response", hook.get("toolResponse")),
+            )
+    return calls
+
+
+def backfill_session_event_run_ids(conn):
+    rows = conn.execute(
+        """
+        SELECT rowid, run_id, session_id
+        FROM events
+        WHERE source_event_type='UserPromptSubmit'
+          AND session_id IS NOT NULL
+          AND run_id IS NOT NULL
+        ORDER BY session_id, rowid
+        """
+    ).fetchall()
+    for row in rows:
+        next_row = conn.execute(
+            """
+            SELECT MIN(rowid) AS rowid
+            FROM events
+            WHERE session_id=?
+              AND source_event_type='UserPromptSubmit'
+              AND rowid>?
+            """,
+            [row["session_id"], row["rowid"]],
+        ).fetchone()
+        next_rowid = next_row["rowid"] if next_row else None
+        if next_rowid is None:
+            conn.execute(
+                "UPDATE events SET run_id=? WHERE session_id=? AND run_id IS NULL AND rowid>=?",
+                [row["run_id"], row["session_id"], row["rowid"]],
+            )
+        else:
+            conn.execute(
+                "UPDATE events SET run_id=? WHERE session_id=? AND run_id IS NULL AND rowid>=? AND rowid<?",
+                [row["run_id"], row["session_id"], row["rowid"], next_rowid],
+            )
+
+
+def backfill_prompt_runs(conn):
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM events
+        WHERE source_event_type='UserPromptSubmit'
+          AND (run_id IS NOT NULL OR source_payload_sanitized IS NOT NULL)
+        ORDER BY COALESCE(occurred_at, observed_at), rowid
+        """
+    ).fetchall()
+    for row in rows:
+        existing_run_id = row["run_id"]
+        if existing_run_id and conn.execute("SELECT id FROM runs WHERE id=?", [existing_run_id]).fetchone():
+            continue
+        payload = json_or_value(row["source_payload_sanitized"])
+        if not isinstance(payload, dict):
+            continue
+        hook = (((payload.get("extensions") or {}).get("openai.codex.hook")) or {})
+        if not isinstance(hook, dict):
+            continue
+        prompt = str(hook.get("prompt") or "").strip()
+        if not prompt:
+            continue
+        run_id = existing_run_id or "run_" + sha256_text(row["id"])[:32]
+        if conn.execute("SELECT id FROM runs WHERE id=?", [run_id]).fetchone():
+            continue
+        session_id = row["session_id"] or hook.get("session_id")
+        started_at = row["occurred_at"] or row["observed_at"]
+        repo_path = str(hook.get("cwd") or "")
+        if session_id:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO sessions (
+                    id, repository_path, repository_remote_hash, started_at, ended_at, final_outcome, task_summary
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                [session_id, repo_path or "unknown", None, started_at, None, None, prompt[:240]],
+            )
+            turn_number = conn.execute(
+                "SELECT COALESCE(MAX(turn_number), 0) + 1 AS n FROM runs WHERE session_id=?",
+                [session_id],
+            ).fetchone()["n"]
+        else:
+            turn_number = 1
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO runs (
+                id, session_id, turn_number, prompt, prompt_hash, repository_path, base_commit,
+                resulting_commit, model, agent_adapter, agent_version, wrapper_version,
+                codex_config_hash, agents_md_hash, verifier_version, started_at, completed_at,
+                duration_ms, agent_status, verifier_status, human_status, lifecycle_status,
+                input_tokens, cached_input_tokens, output_tokens
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, NULL, NULL, ?, ?, ?, ?, NULL, NULL, NULL)
+            """,
+            [
+                run_id,
+                session_id,
+                turn_number,
+                prompt,
+                sha256_text(prompt),
+                repo_path or "unknown",
+                "unknown",
+                hook.get("model"),
+                "codex-hooks",
+                started_at,
+                "prompt_submitted",
+                "unverified",
+                "not_reviewed",
+                "still_open",
+            ],
+        )
+    backfill_session_event_run_ids(conn)
+
+
 if action == "runs":
     if not os.path.exists(db_path):
         emit([])
         raise SystemExit(0)
     with connect() as conn:
+        backfill_prompt_runs(conn)
+        conn.commit()
         emit([row_to_dict(row) for row in conn.execute("SELECT * FROM runs ORDER BY started_at DESC, id DESC")])
 elif action == "details":
     if not os.path.exists(db_path):
         raise SystemExit("Agent Quality database does not exist yet.")
     run_id = payload.get("run_id")
     with connect() as conn:
+        backfill_prompt_runs(conn)
+        conn.commit()
         run = conn.execute("SELECT * FROM runs WHERE id=?", [run_id]).fetchone()
         if not run:
             raise SystemExit("unknown run: " + str(run_id))
@@ -419,7 +789,7 @@ elif action == "details":
             "artifacts": [
                 row_to_dict(row)
                 for row in conn.execute("SELECT * FROM artifacts WHERE run_id=? ORDER BY artifact_type, path", [run_id])
-            ],
+            ] + event_artifacts(conn, run_id),
             "verifier_results": [
                 row_to_dict(row)
                 for row in conn.execute("SELECT * FROM verifier_results WHERE run_id=? ORDER BY started_at, verifier_name", [run_id])
@@ -431,6 +801,9 @@ elif action == "details":
                     [run_id],
                 )
             ],
+            "agent_outputs": agent_outputs(conn, run_id),
+            "reasoning_trace": reasoning_trace(conn, run_id),
+            "tool_calls": tool_calls(conn, run_id),
             "human_reviews": [
                 row_to_dict(row)
                 for row in conn.execute(
@@ -529,7 +902,7 @@ function dashboardDbQuery(folder, action, payload) {
   const python = pythonInvocation();
   return new Promise((resolve, reject) => {
     cp.execFile(python.command, [...python.prefixArgs, "-c", DASHBOARD_DB_SCRIPT, dbPath, action, JSON.stringify(payload || {})], {
-      cwd: folder.uri.fsPath,
+      cwd: projectRootPath(folder),
       env: commandEnv(folder),
       timeout: 15000,
       windowsHide: true,
@@ -693,7 +1066,7 @@ function execAq(args, folder) {
   const invocation = aqInvocation(folder);
   return new Promise((resolve, reject) => {
     cp.execFile(invocation.command, [...invocation.prefixArgs, ...args], {
-      cwd: folder.uri.fsPath,
+      cwd: projectRootPath(folder),
       env: commandEnv(folder),
       timeout: 15000,
       windowsHide: true
@@ -720,11 +1093,12 @@ async function resolveRunId(item) {
 }
 
 function configuredVerifyPath(folder) {
+  const repo = projectRootPath(folder);
   const configured = getConfig().get("verifyPath");
   if (configured) {
-    return path.isAbsolute(configured) ? configured : path.join(folder.uri.fsPath, configured);
+    return path.isAbsolute(configured) ? configured : path.join(repo, configured);
   }
-  const defaultPath = path.join(folder.uri.fsPath, ".agent-quality", "verify.yaml");
+  const defaultPath = path.join(repo, ".agent-quality", "verify.yaml");
   return fs.existsSync(defaultPath) ? defaultPath : undefined;
 }
 
@@ -760,11 +1134,12 @@ function aqInvocation(folder) {
 
 function cliSourceRoot(folder) {
   const configured = getConfig().get("cliSourceRoot");
+  const repo = projectRootPath(folder);
   if (configured) {
-    return path.isAbsolute(configured) ? configured : path.join(folder.uri.fsPath, configured);
+    return path.isAbsolute(configured) ? configured : path.join(repo, configured);
   }
 
-  for (const candidate of cliSourceRootCandidates(folder.uri.fsPath)) {
+  for (const candidate of cliSourceRootCandidates(repo)) {
     if (hasCliSource(candidate)) {
       return candidate;
     }
@@ -838,10 +1213,33 @@ function splitCommandLine(value) {
 
 function agentQualityHome(folder) {
   const configured = getConfig().get("home");
+  const repo = projectRootPath(folder);
   if (configured) {
-    return path.isAbsolute(configured) ? configured : path.join(folder.uri.fsPath, configured);
+    return path.isAbsolute(configured) ? configured : path.join(repo, configured);
   }
-  return path.join(folder.uri.fsPath, ".agent-quality", "local");
+  return path.join(repo, ".agent-quality", "local");
+}
+
+function projectRootPath(folder) {
+  const workspacePath = folder.uri.fsPath;
+  let current = path.resolve(workspacePath);
+  try {
+    if (fs.existsSync(current) && fs.statSync(current).isFile()) {
+      current = path.dirname(current);
+    }
+  } catch {
+    return current;
+  }
+  while (true) {
+    if (fs.existsSync(path.join(current, ".git"))) {
+      return current;
+    }
+    const parent = path.dirname(current);
+    if (parent === current) {
+      return path.resolve(workspacePath);
+    }
+    current = parent;
+  }
 }
 
 async function pickWorkspaceFolder() {

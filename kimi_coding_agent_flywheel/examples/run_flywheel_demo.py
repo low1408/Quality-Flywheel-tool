@@ -341,6 +341,7 @@ async def main():
     print("\n[3] Initializing quality flywheel...")
     config = FlywheelConfig(
         benchmark_suite_path="data/benchmarks/demo_suite.json",
+        use_mock_judge=True,
         genetic_generations=3,
         genetic_population=6,
         output_dir="data/flywheel_demo",

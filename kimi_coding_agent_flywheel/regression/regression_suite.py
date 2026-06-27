@@ -511,6 +511,58 @@ class RegressionSuite:
 
         return suite
 
+    def load_from_aq_cases(self, repo_path: str | Path | None = None) -> None:
+        """Load regression tests from the agent-quality cases directory."""
+        cases_dir = Path(repo_path or Path.cwd()) / ".agent-quality" / "cases"
+        if not cases_dir.exists():
+            return
+            
+        import yaml
+        from agent_quality.config import _parse_tiny_yaml
+        
+        for case_dir in cases_dir.iterdir():
+            if not case_dir.is_dir():
+                continue
+            case_yaml_path = case_dir / "case.yaml"
+            prompt_path = case_dir / "prompt.md"
+            if not case_yaml_path.exists():
+                continue
+                
+            try:
+                # Load case details
+                text = case_yaml_path.read_text(encoding="utf-8")
+                try:
+                    case_data = yaml.safe_load(text)
+                except Exception:
+                    case_data = _parse_tiny_yaml(text)
+                
+                # Load prompt
+                prompt = ""
+                if prompt_path.exists():
+                    prompt = prompt_path.read_text(encoding="utf-8")
+                
+                # Construct Kimi DTO structure
+                test_id = case_data.get("id", case_dir.name)
+                task_data = {
+                    "task_id": f"regression::{test_id}",
+                    "instruction": prompt,
+                }
+                
+                test = RegressionTest(
+                    test_id=test_id,
+                    name=case_data.get("name", f"Regression test {test_id}"),
+                    description=case_data.get("description", f"Prevents recurrence of {test_id}"),
+                    task=task_data,
+                    derived_from_failure=case_data.get("source", {}).get("run_id"),
+                    derived_from_cluster=None,
+                    created_date=datetime.utcnow(),
+                )
+                self.add_test(test)
+            except Exception as e:
+                import sys
+                print(f"Warning: Failed to load regression case {case_dir.name}: {e}", file=sys.stderr)
+
+
 
 # -----------------------------------------------------------------------------
 # Quality Gate
