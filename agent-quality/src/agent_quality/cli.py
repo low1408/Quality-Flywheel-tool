@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 from agent_quality.adapters.codex_hooks import main as codex_hook_main
+from agent_quality.adapters.antigravity import main as antigravity_hook_main
 from agent_quality.collector.envelope import normalize_envelope
 from agent_quality.collector.server import serve
 from agent_quality.db import all_rows, connect, insert, one
@@ -42,10 +43,16 @@ def main(argv: list[str] | None = None) -> None:
     hook_sub = hook.add_subparsers(dest="hook", required=True)
     codex_hook = hook_sub.add_parser("codex")
     codex_hook.add_argument("event")
+    antigravity_hook = hook_sub.add_parser("antigravity")
+    antigravity_hook.add_argument("event")
 
     install_hooks = sub.add_parser("install-codex-hooks")
     install_hooks.add_argument("--repo", default=".")
     install_hooks.add_argument("--python", default=sys.executable)
+
+    install_antigravity_hooks = sub.add_parser("install-antigravity-hooks")
+    install_antigravity_hooks.add_argument("--repo", default=".")
+    install_antigravity_hooks.add_argument("--python", default=sys.executable)
 
     server = sub.add_parser("serve-collector")
     server.add_argument("--host", default="127.0.0.1")
@@ -91,8 +98,12 @@ def main(argv: list[str] | None = None) -> None:
         _ingest(args.file)
     elif args.command == "hook" and args.hook == "codex":
         raise SystemExit(codex_hook_main([args.event]))
+    elif args.command == "hook" and args.hook == "antigravity":
+        raise SystemExit(antigravity_hook_main([args.event]))
     elif args.command == "install-codex-hooks":
         _install_codex_hooks(Path(args.repo), args.python)
+    elif args.command == "install-antigravity-hooks":
+        _install_antigravity_hooks(Path(args.repo), args.python)
     elif args.command == "serve-collector":
         serve(args.host, args.port, token=args.token)
     elif args.command == "review":
@@ -168,6 +179,45 @@ def _install_codex_hooks(repo: Path, python: str) -> None:
     _ensure_codex_hooks_enabled(codex_dir / "config.toml")
     print(f"installed Codex hooks: {codex_dir / 'hooks.json'}")
     print(f"enabled Codex hooks: {codex_dir / 'config.toml'}")
+
+
+def _install_antigravity_hooks(repo: Path, python: str) -> None:
+    repo = _project_root(repo)
+    agents_dir = repo / ".agents"
+    agents_dir.mkdir(parents=True, exist_ok=True)
+    aq_home = repo / ".agent-quality" / "local"
+    aq_home.mkdir(parents=True, exist_ok=True)
+    tool_src = Path(__file__).resolve().parents[1]
+    command = (
+        f"AGENT_QUALITY_HOME={shlex.quote(str(aq_home))} "
+        f"PYTHONPATH={shlex.quote(str(tool_src))} "
+        f"{shlex.quote(python)} -m agent_quality.cli hook antigravity"
+    )
+    
+    antigravity_hooks = {
+        "PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": f"{command} PreToolUse"}]}],
+        "PostToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": f"{command} PostToolUse"}]}],
+        "PreInvocation": [{"hooks": [{"type": "command", "command": f"{command} PreInvocation"}]}],
+        "PostInvocation": [{"hooks": [{"type": "command", "command": f"{command} PostInvocation"}]}],
+        "Stop": [{"hooks": [{"type": "command", "command": f"{command} Stop", "timeout": 30}]}]
+    }
+
+    hooks_file = agents_dir / "hooks.json"
+    
+    # Safe Merging to prevent overwriting shared workspace hooks
+    existing_data: dict[str, Any] = {}
+    if hooks_file.exists():
+        try:
+            existing_data = json.loads(hooks_file.read_text(encoding="utf-8"))
+            if not isinstance(existing_data, dict):
+                existing_data = {}
+        except Exception:
+            existing_data = {}
+
+    existing_data["agent-quality"] = antigravity_hooks
+    
+    hooks_file.write_text(json.dumps(existing_data, indent=2) + "\n", encoding="utf-8")
+    print(f"installed Antigravity hooks: {hooks_file}")
 
 
 def _project_root(repo: Path) -> Path:

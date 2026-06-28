@@ -33,6 +33,16 @@
           </div>
           <div class="rail-controls">
             <input id="runSearch" type="search" autocomplete="off" placeholder="Search runs" aria-label="Search runs by prompt, model, repository, status, or run ID">
+            <select id="viewMode" aria-label="View mode">
+              <option value="chats">Chats (Sessions)</option>
+              <option value="runs">Individual Runs</option>
+            </select>
+            <select id="chatFilter" aria-label="Chat filter">
+              <option value="all">All chats</option>
+            </select>
+            <select id="agentFilter" aria-label="Agent filter">
+              <option value="all">All agents</option>
+            </select>
             <select id="statusFilter" aria-label="Status filter">
               <option value="all">All statuses</option>
               <option value="passed">Verifier passed</option>

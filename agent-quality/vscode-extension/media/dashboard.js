@@ -62,6 +62,8 @@
     elements.runList = document.getElementById("runList");
     elements.runSearch = document.getElementById("runSearch");
     elements.viewMode = document.getElementById("viewMode");
+    elements.chatFilter = document.getElementById("chatFilter");
+    elements.agentFilter = document.getElementById("agentFilter");
     elements.statusFilter = document.getElementById("statusFilter");
     elements.detailPane = document.getElementById("detailPane");
     elements.modalBackdrop = document.getElementById("modalBackdrop");
@@ -143,7 +145,11 @@
   }
 
   function handleChange(event) {
-    if (event.target === elements.statusFilter) {
+    if (
+      event.target === elements.statusFilter ||
+      event.target === elements.agentFilter ||
+      event.target === elements.chatFilter
+    ) {
       renderRuns();
       return;
     }
@@ -171,6 +177,8 @@
       if (state.selectedRunId && !state.runs.some((run) => run.id === state.selectedRunId)) {
         state.selectedRunId = state.runs.length ? state.runs[0].id : null;
       }
+      updateChatFilterOptions();
+      updateAgentFilterOptions();
       renderRuns();
       if (state.selectedRunId) {
         await loadRunDetails(state.selectedRunId);
@@ -182,6 +190,47 @@
     } catch (error) {
       setSync("Error");
       renderError(error);
+    }
+  }
+
+  function updateChatFilterOptions() {
+    const sessions = new Set();
+    state.runs.forEach((run) => {
+      const sessionId = run.session_id || (state.viewMode === "chats" ? run.id : "");
+      if (sessionId) {
+        sessions.add(sessionId);
+      }
+    });
+    const currentValue = elements.chatFilter.value;
+    let html = '<option value="all">All chats</option>';
+    Array.from(sessions).sort().forEach((session) => {
+      html += `<option value="${escapeAttr(session)}">Chat: ${escapeHtml(session.substring(0, 8))}...</option>`;
+    });
+    elements.chatFilter.innerHTML = html;
+    if (Array.from(sessions).includes(currentValue)) {
+      elements.chatFilter.value = currentValue;
+    } else {
+      elements.chatFilter.value = "all";
+    }
+  }
+
+  function updateAgentFilterOptions() {
+    const agents = new Set();
+    state.runs.forEach((run) => {
+      if (run.agent_adapter) {
+        agents.add(run.agent_adapter);
+      }
+    });
+    const currentValue = elements.agentFilter.value;
+    let html = '<option value="all">All agents</option>';
+    Array.from(agents).sort().forEach((agent) => {
+      html += `<option value="${escapeAttr(agent)}">${escapeHtml(agent)}</option>`;
+    });
+    elements.agentFilter.innerHTML = html;
+    if (Array.from(agents).includes(currentValue)) {
+      elements.agentFilter.value = currentValue;
+    } else {
+      elements.agentFilter.value = "all";
     }
   }
 
@@ -245,9 +294,13 @@
 
   function filteredRuns() {
     const filter = elements.statusFilter.value;
+    const agentFilter = elements.agentFilter.value;
+    const chatFilter = elements.chatFilter.value;
     return state.runs.filter((run) => {
+      const sessionId = run.session_id || (state.viewMode === "chats" ? run.id : "");
       const haystack = [
         run.id,
+        sessionId,
         run.prompt || run.task_summary,
         run.agent_adapter,
         run.model,
@@ -260,16 +313,19 @@
         return false;
       }
       if (filter === "passed") {
-        return run.verifier_status === "passed";
+        if (run.verifier_status !== "passed") return false;
+      } else if (filter === "failed") {
+        if (run.verifier_status !== "failed" && run.agent_status !== "failed") return false;
+      } else if (filter === "reviewed") {
+        if (!run.human_status || ["not_reviewed", "review_skipped"].includes(run.human_status)) return false;
+      } else if (filter === "unreviewed") {
+        if (run.human_status && run.human_status !== "not_reviewed") return false;
       }
-      if (filter === "failed") {
-        return run.verifier_status === "failed" || run.agent_status === "failed";
+      if (agentFilter !== "all") {
+        if (run.agent_adapter !== agentFilter) return false;
       }
-      if (filter === "reviewed") {
-        return run.human_status && !["not_reviewed", "review_skipped"].includes(run.human_status);
-      }
-      if (filter === "unreviewed") {
-        return !run.human_status || run.human_status === "not_reviewed";
+      if (chatFilter !== "all") {
+        if (sessionId !== chatFilter) return false;
       }
       return true;
     });

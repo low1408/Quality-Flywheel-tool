@@ -48,7 +48,8 @@
     runs: [],
     saveTimer: 0,
     selectedEventId: null,
-    selectedRunId: initialRunId
+    selectedRunId: initialRunId,
+    viewMode: "chats"
   };
   const elements = {};
 
@@ -60,6 +61,9 @@
     elements.runCount = document.getElementById("runCount");
     elements.runList = document.getElementById("runList");
     elements.runSearch = document.getElementById("runSearch");
+    elements.viewMode = document.getElementById("viewMode");
+    elements.chatFilter = document.getElementById("chatFilter");
+    elements.agentFilter = document.getElementById("agentFilter");
     elements.statusFilter = document.getElementById("statusFilter");
     elements.detailPane = document.getElementById("detailPane");
     elements.modalBackdrop = document.getElementById("modalBackdrop");
@@ -141,8 +145,19 @@
   }
 
   function handleChange(event) {
-    if (event.target === elements.statusFilter) {
+    if (
+      event.target === elements.statusFilter ||
+      event.target === elements.agentFilter ||
+      event.target === elements.chatFilter
+    ) {
       renderRuns();
+      return;
+    }
+    if (event.target === elements.viewMode) {
+      state.viewMode = event.target.value;
+      state.selectedRunId = null;
+      state.details = null;
+      loadRuns();
       return;
     }
     if (event.target.closest("#reviewForm")) {
@@ -153,14 +168,17 @@
   async function loadRuns() {
     setSync("Loading");
     try {
-      const runs = await request("loadRuns");
-      state.runs = Array.isArray(runs) ? runs : runs.runs || [];
+      const isChats = state.viewMode === "chats";
+      const items = await request(isChats ? "loadSessions" : "loadRuns");
+      state.runs = Array.isArray(items) ? items : (items.sessions || items.runs || []);
       if (!state.selectedRunId && state.runs.length) {
         state.selectedRunId = state.runs[0].id;
       }
       if (state.selectedRunId && !state.runs.some((run) => run.id === state.selectedRunId)) {
         state.selectedRunId = state.runs.length ? state.runs[0].id : null;
       }
+      updateChatFilterOptions();
+      updateAgentFilterOptions();
       renderRuns();
       if (state.selectedRunId) {
         await loadRunDetails(state.selectedRunId);
@@ -172,6 +190,47 @@
     } catch (error) {
       setSync("Error");
       renderError(error);
+    }
+  }
+
+  function updateChatFilterOptions() {
+    const sessions = new Set();
+    state.runs.forEach((run) => {
+      const sessionId = run.session_id || (state.viewMode === "chats" ? run.id : "");
+      if (sessionId) {
+        sessions.add(sessionId);
+      }
+    });
+    const currentValue = elements.chatFilter.value;
+    let html = '<option value="all">All chats</option>';
+    Array.from(sessions).sort().forEach((session) => {
+      html += `<option value="${escapeAttr(session)}">Chat: ${escapeHtml(session.substring(0, 8))}...</option>`;
+    });
+    elements.chatFilter.innerHTML = html;
+    if (Array.from(sessions).includes(currentValue)) {
+      elements.chatFilter.value = currentValue;
+    } else {
+      elements.chatFilter.value = "all";
+    }
+  }
+
+  function updateAgentFilterOptions() {
+    const agents = new Set();
+    state.runs.forEach((run) => {
+      if (run.agent_adapter) {
+        agents.add(run.agent_adapter);
+      }
+    });
+    const currentValue = elements.agentFilter.value;
+    let html = '<option value="all">All agents</option>';
+    Array.from(agents).sort().forEach((agent) => {
+      html += `<option value="${escapeAttr(agent)}">${escapeHtml(agent)}</option>`;
+    });
+    elements.agentFilter.innerHTML = html;
+    if (Array.from(agents).includes(currentValue)) {
+      elements.agentFilter.value = currentValue;
+    } else {
+      elements.agentFilter.value = "all";
     }
   }
 
@@ -191,7 +250,8 @@
     state.details = null;
     renderDetail(true);
     try {
-      state.details = await request("loadRunDetails", { run_id: runId });
+      const isChats = state.viewMode === "chats";
+      state.details = await request(isChats ? "loadSessionDetails" : "loadRunDetails", isChats ? { session_id: runId } : { run_id: runId });
       renderDetail();
       setSync("Idle");
     } catch (error) {
@@ -204,15 +264,17 @@
     const filtered = filteredRuns();
     elements.runCount.textContent = `${filtered.length} of ${state.runs.length}`;
     if (!filtered.length) {
-      elements.runList.innerHTML = '<div class="empty-copy">No runs found.</div>';
+      elements.runList.innerHTML = `<div class="empty-copy">No ${state.viewMode === "chats" ? "chats" : "runs"} found.</div>`;
       return;
     }
     elements.runList.innerHTML = filtered.map((run) => {
       const active = run.id === state.selectedRunId ? " is-active" : "";
-      const prompt = summaryText(run.prompt, 96, "No prompt captured");
+      const promptText = run.prompt || run.task_summary || "No prompt captured";
+      const prompt = summaryText(promptText, 96, "No prompt captured");
       const meta = [
         run.started_at ? formatDate(run.started_at) : "",
-        run.model || ""
+        run.model || "",
+        run.turn_count > 1 ? `${run.turn_count} turns` : ""
       ].filter(Boolean).join(" - ");
       return `
         <button type="button" class="run-card${active}" data-action="selectRun" data-run-id="${escapeAttr(run.id)}">
@@ -232,10 +294,14 @@
 
   function filteredRuns() {
     const filter = elements.statusFilter.value;
+    const agentFilter = elements.agentFilter.value;
+    const chatFilter = elements.chatFilter.value;
     return state.runs.filter((run) => {
+      const sessionId = run.session_id || (state.viewMode === "chats" ? run.id : "");
       const haystack = [
         run.id,
-        run.prompt,
+        sessionId,
+        run.prompt || run.task_summary,
         run.agent_adapter,
         run.model,
         run.repository_path,
@@ -247,16 +313,19 @@
         return false;
       }
       if (filter === "passed") {
-        return run.verifier_status === "passed";
+        if (run.verifier_status !== "passed") return false;
+      } else if (filter === "failed") {
+        if (run.verifier_status !== "failed" && run.agent_status !== "failed") return false;
+      } else if (filter === "reviewed") {
+        if (!run.human_status || ["not_reviewed", "review_skipped"].includes(run.human_status)) return false;
+      } else if (filter === "unreviewed") {
+        if (run.human_status && run.human_status !== "not_reviewed") return false;
       }
-      if (filter === "failed") {
-        return run.verifier_status === "failed" || run.agent_status === "failed";
+      if (agentFilter !== "all") {
+        if (run.agent_adapter !== agentFilter) return false;
       }
-      if (filter === "reviewed") {
-        return run.human_status && !["not_reviewed", "review_skipped"].includes(run.human_status);
-      }
-      if (filter === "unreviewed") {
-        return !run.human_status || run.human_status === "not_reviewed";
+      if (chatFilter !== "all") {
+        if (sessionId !== chatFilter) return false;
       }
       return true;
     });
@@ -264,27 +333,33 @@
 
   function renderDetail(loading) {
     if (loading) {
-      elements.detailPane.innerHTML = '<div class="empty-state"><h2>Loading run</h2><p>...</p></div>';
+      elements.detailPane.innerHTML = `<div class="empty-state"><h2>Loading ${state.viewMode === "chats" ? "chat" : "run"}</h2><p>...</p></div>`;
       return;
     }
     const details = state.details;
-    if (!details || !details.run) {
-      elements.detailPane.innerHTML = '<div class="empty-state"><h2>No run selected</h2><p>No active selection.</p></div>';
+    if (!details || (!details.run && !details.session)) {
+      elements.detailPane.innerHTML = `<div class="empty-state"><h2>No ${state.viewMode === "chats" ? "chat" : "run"} selected</h2><p>No active selection.</p></div>`;
       return;
     }
-    const run = details.run;
+    const run = details.run || details.session;
+    const agentStatus = details.run ? (details.run.agent_status || "agent_unknown") : (details.turns.length ? (details.turns[details.turns.length - 1].run.agent_status || "agent_unknown") : "agent_unknown");
+    const verifierStatus = details.run ? (details.run.verifier_status || "unverified") : (details.turns.length ? (details.turns[details.turns.length - 1].run.verifier_status || "unverified") : "unverified");
+    const humanStatus = details.run ? (details.run.human_status || "not_reviewed") : (details.turns.length ? (details.turns[details.turns.length - 1].run.human_status || "not_reviewed") : "not_reviewed");
+    const lifecycleStatus = details.run ? (details.run.lifecycle_status || "lifecycle_unknown") : (details.turns.length ? (details.turns[details.turns.length - 1].run.lifecycle_status || "lifecycle_unknown") : "lifecycle_unknown");
+    
+    const promptText = run.prompt || run.task_summary || "Details";
     const selectedTabId = `run-tab-${state.activeTab}`;
     elements.detailPane.innerHTML = `
       <div class="detail-layout">
         <div class="detail-head">
           <div class="detail-title">
-            <h2>${escapeHtml(summaryText(run.prompt, 104, "Run details"))}</h2>
+            <h2>${escapeHtml(summaryText(promptText, 104, "Details"))}</h2>
             <p>${escapeHtml(run.repository_path || "n/a")}</p>
             <div class="status-row">
-              ${statusChip(run.agent_status || "agent_unknown")}
-              ${statusChip(run.verifier_status || "unverified")}
-              ${statusChip(run.human_status || "not_reviewed")}
-              ${statusChip(run.lifecycle_status || "lifecycle_unknown")}
+              ${statusChip(agentStatus)}
+              ${statusChip(verifierStatus)}
+              ${statusChip(humanStatus)}
+              ${statusChip(lifecycleStatus)}
             </div>
           </div>
           <div class="detail-actions">
@@ -292,7 +367,7 @@
             <button type="button" class="button primary" data-action="setTab" data-tab="review">Review</button>
           </div>
         </div>
-        <div class="tabs" role="tablist" aria-label="Run views">
+        <div class="tabs" role="tablist" aria-label="Views">
           ${tabs.map(([id, label]) => `
             <button
               type="button"
@@ -315,13 +390,13 @@
 
   function renderActiveTab(details) {
     if (state.activeTab === "verifiers") {
-      return renderVerifiers(details.verifier_results || []);
+      return renderVerifiers(details.verifier_results || details.all_verifier_results || []);
     }
     if (state.activeTab === "artifacts") {
-      return renderArtifacts(details.artifacts || []);
+      return renderArtifacts(details.artifacts || details.all_artifacts || []);
     }
     if (state.activeTab === "timeline") {
-      return renderTimeline(details.events || []);
+      return renderTimeline(details.events || details.all_events || []);
     }
     if (state.activeTab === "review") {
       return renderReview(details);
@@ -330,6 +405,59 @@
   }
 
   function renderOverview(details) {
+    if (details.turns) {
+      // Sessions / Chats Overview Mode
+      return `
+        <div class="overview-stack">
+          <div class="overview-primary">
+            ${details.turns.map((turn, index) => {
+              const run = turn.run;
+              const outputs = turn.agent_outputs || [];
+              const latestOutput = outputs.length ? outputs[outputs.length - 1] : null;
+              const reasoningTrace = turn.reasoning_trace || [];
+              const toolCalls = turn.tool_calls || [];
+              return `
+                <div class="chat-turn-card">
+                  <div class="chat-turn-header">Turn ${index + 1} (${escapeHtml(run.id)})</div>
+                  <section class="reading-section" aria-labelledby="prompt-heading-${run.id}">
+                    <h3 id="prompt-heading-${run.id}" class="section-title">Prompt</h3>
+                    <pre class="prompt-block reading-content">${escapeHtml(run.prompt || "No prompt captured.")}</pre>
+                  </section>
+                  <section class="reading-section" aria-labelledby="output-heading-${run.id}">
+                    <h3 id="output-heading-${run.id}" class="section-title">Agent output</h3>
+                    ${latestOutput ? outputBlock(latestOutput) : '<div class="empty-copy reading-empty">No agent output captured yet.</div>'}
+                  </section>
+                  <details class="chat-turn-details">
+                    <summary>Reasoning & Tool Calls</summary>
+                    <div style="padding-top: 10px;">
+                      <section class="reading-section" aria-labelledby="reasoning-heading-${run.id}">
+                        <h4 id="reasoning-heading-${run.id}" class="section-subtitle" style="font-size: 12px; margin-bottom: 8px;">Reasoning trace</h4>
+                        ${reasoningTraceBlock(reasoningTrace)}
+                      </section>
+                      <section class="reading-section" aria-labelledby="tools-heading-${run.id}" style="margin-top: 16px;">
+                        <h4 id="tools-heading-${run.id}" class="section-subtitle" style="font-size: 12px; margin-bottom: 8px;">Tool calls</h4>
+                        ${toolCallsBlock(toolCalls)}
+                      </section>
+                    </div>
+                  </details>
+                </div>
+              `;
+            }).join("")}
+          </div>
+          <details class="overview-secondary session-secondary">
+            <summary>Session details</summary>
+            <div class="overview-grid">
+              ${kv("Started", formatDate(details.session.started_at))}
+              ${kv("Ended", formatDate(details.session.ended_at))}
+              ${kv("Session ID", value(details.session.id))}
+              ${kv("Repository", value(details.session.repository_path))}
+              ${kv("Turns count", details.turns.length)}
+            </div>
+          </details>
+        </div>
+      `;
+    }
+
     const run = details.run;
     const outputs = details.agent_outputs || [];
     const latestOutput = outputs.length ? outputs[outputs.length - 1] : null;
@@ -463,8 +591,11 @@
   }
 
   function renderReview(details) {
-    const run = details.run;
-    const review = (details.human_reviews || [])[0] || {};
+    const run = details.run || (details.turns && details.turns.length ? details.turns[details.turns.length - 1].run : null);
+    if (!run) {
+      return '<div class="empty-copy">No run to review.</div>';
+    }
+    const review = details.run ? ((details.human_reviews || [])[0] || {}) : (details.turns && details.turns.length ? ((details.turns[details.turns.length - 1].human_reviews || [])[0] || {}) : {});
     const confidence = Number.isFinite(Number(review.confidence)) ? Number(review.confidence) : 0.75;
     return `
       <form id="reviewForm" class="review-form">
@@ -507,7 +638,11 @@
 
   async function saveReviewNow() {
     const form = document.getElementById("reviewForm");
-    if (!form || !state.details || !state.details.run) {
+    if (!form || !state.details) {
+      return;
+    }
+    const run = state.details.run || (state.details.turns && state.details.turns.length ? state.details.turns[state.details.turns.length - 1].run : null);
+    if (!run) {
       return;
     }
     window.clearTimeout(state.saveTimer);
@@ -515,7 +650,7 @@
     try {
       const formData = new FormData(form);
       const payload = {
-        run_id: state.details.run.id,
+        run_id: run.id,
         outcome: String(formData.get("outcome") || "not_reviewed"),
         primary_category: emptyToNull(formData.get("primary_category")),
         severity: emptyToNull(formData.get("severity")),
@@ -525,11 +660,17 @@
       };
       const response = await request("saveReview", payload);
       const review = response.review || response;
-      state.details.human_reviews = [review];
-      state.details.run.human_status = review.outcome;
-      const run = state.runs.find((item) => item.id === state.details.run.id);
-      if (run) {
-        run.human_status = review.outcome;
+      if (state.details.run) {
+        state.details.human_reviews = [review];
+        state.details.run.human_status = review.outcome;
+      } else {
+        const lastTurn = state.details.turns[state.details.turns.length - 1];
+        lastTurn.human_reviews = [review];
+        lastTurn.run.human_status = review.outcome;
+      }
+      const runItem = state.runs.find((item) => item.id === (state.details.run ? state.details.run.id : state.details.session.id));
+      if (runItem) {
+        runItem.human_status = review.outcome;
       }
       renderRuns();
       setReviewStatus("Saved");
@@ -566,15 +707,16 @@
   }
 
   async function openDiff() {
-    const runId = state.details && state.details.run && state.details.run.id;
-    if (!runId) {
+    const run = state.details && (state.details.run || (state.details.turns && state.details.turns.length ? state.details.turns[state.details.turns.length - 1].run : null));
+    if (!run) {
       return;
     }
+    const runId = run.id;
     if (vscode) {
       await request("openDiff", { run_id: runId });
       return;
     }
-    const artifacts = state.details.artifacts || [];
+    const artifacts = state.details.artifacts || state.details.all_artifacts || [];
     const patch = artifacts.find((artifact) => ["final_patch", "diff", "patch"].includes(artifact.artifact_type));
     if (patch && patch.path) {
       await previewPath(patch.path);
@@ -591,8 +733,15 @@
       const response = await fetchJson("/v1/ui/api/runs");
       return response;
     }
+    if (command === "loadSessions") {
+      const response = await fetchJson("/v1/ui/api/sessions");
+      return response;
+    }
     if (command === "loadRunDetails") {
       return fetchJson(`/v1/ui/api/run/${encodeURIComponent(payload.run_id)}`);
+    }
+    if (command === "loadSessionDetails") {
+      return fetchJson(`/v1/ui/api/session/${encodeURIComponent(payload.session_id)}`);
     }
     if (command === "saveReview") {
       return fetchJson("/v1/ui/api/review", {

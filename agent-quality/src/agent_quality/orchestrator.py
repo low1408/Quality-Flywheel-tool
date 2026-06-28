@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import time
 from pathlib import Path
 
 from agent_quality import __version__
-from agent_quality.adapters.codex_cli import extract_usage, rows_from_jsonl
 from agent_quality.capture.artifacts import write_artifact
 from agent_quality.capture.git_state import diff, file_hash_if_exists, head_commit, repo_root, status_porcelain
 from agent_quality.config import load_verify_config
@@ -45,9 +45,20 @@ def run_task(
     verify_config = load_verify_config(verify_path)
     prompt_hash = sha256_text(prompt)
     begin = time.monotonic()
-    command = agent_command or ["codex", "exec", "--json", "--sandbox", "workspace-write", prompt]
-    if model and not agent_command:
-        command = ["codex", "exec", "--json", "--model", model, "--sandbox", "workspace-write", prompt]
+
+    # Determine command
+    command = agent_command
+    if not command:
+        command = ["codex", "exec", "--json", "--sandbox", "workspace-write", prompt]
+        if model:
+            command = ["codex", "exec", "--json", "--model", model, "--sandbox", "workspace-write", prompt]
+    elif len(command) == 1:
+        executable = Path(command[0]).name
+        if executable == "agy":
+            command = [command[0], "-p", "--output-format", "json", "--dangerously-skip-permissions", prompt]
+        elif executable == "antigravity":
+            command = [command[0], "chat", prompt]
+
     agent_adapter = _agent_adapter(command)
     agent_status = "created"
     verifier_status = None
@@ -82,7 +93,7 @@ def run_task(
                     "resulting_commit": None,
                     "model": model,
                     "agent_adapter": agent_adapter,
-                    "agent_version": _codex_version() if agent_adapter == "codex-cli" else None,
+                    "agent_version": _agent_version(agent_adapter),
                     "wrapper_version": __version__,
                     "codex_config_hash": file_hash_if_exists(repo, ".codex/config.toml"),
                     "agents_md_hash": file_hash_if_exists(repo, "AGENTS.md"),
@@ -113,9 +124,14 @@ def run_task(
         stderr = ""
         exit_code = 127
         try:
+            # Propagate AGENT_QUALITY_RUN_ID in environment
+            env = os.environ.copy()
+            env["AGENT_QUALITY_RUN_ID"] = run_id
+
             proc = subprocess.run(
                 command,
                 cwd=repo,
+                env=env,
                 text=True,
                 capture_output=True,
                 timeout=agent_timeout_seconds,
@@ -135,7 +151,19 @@ def run_task(
             agent_status = "failed"
 
         raw_lines = stdout.splitlines()
-        rows = rows_from_jsonl(raw_lines, run_id=run_id, session_id=session_id)
+        
+        # Dynamically dispatch adapter parsing functions based on agent_adapter
+        import agent_quality.adapters.codex_cli as codex_cli
+        import agent_quality.adapters.antigravity as antigravity_cli
+
+        if agent_adapter in ("antigravity", "agy"):
+            adapter_rows_from_jsonl = antigravity_cli.rows_from_jsonl
+            adapter_extract_usage = antigravity_cli.extract_usage
+        else:
+            adapter_rows_from_jsonl = codex_cli.rows_from_jsonl
+            adapter_extract_usage = codex_cli.extract_usage
+
+        rows = adapter_rows_from_jsonl(raw_lines, run_id=run_id, session_id=session_id)
         with conn:
             for row in rows:
                 insert(conn, "events", row)
@@ -174,7 +202,7 @@ def run_task(
                     },
                 )
 
-        input_tokens, cached_input_tokens, output_tokens = extract_usage(raw_lines)
+        input_tokens, cached_input_tokens, output_tokens = adapter_extract_usage(raw_lines)
         duration_ms = int((time.monotonic() - begin) * 1000)
         with conn:
             update_run(
@@ -215,7 +243,7 @@ def run_task(
     return run_id
 
 
-def _store_artifact(conn, run_id: str, artifact_type: str, name: str, content: str) -> None:
+def _store_artifact(conn: Any, run_id: str, artifact_type: str, name: str, content: str) -> None:
     artifact_id, path, digest, size = write_artifact(run_id, name, content)
     insert(
         conn,
@@ -231,10 +259,13 @@ def _store_artifact(conn, run_id: str, artifact_type: str, name: str, content: s
     )
 
 
-def _codex_version() -> str | None:
-    if not shutil.which("codex"):
+def _agent_version(agent_adapter: str) -> str | None:
+    executable = agent_adapter
+    if executable == "codex-cli":
+        executable = "codex"
+    if not shutil.which(executable):
         return None
-    proc = subprocess.run(["codex", "--version"], text=True, capture_output=True)
+    proc = subprocess.run([executable, "--version"], text=True, capture_output=True)
     return (proc.stdout or proc.stderr).strip() or None
 
 

@@ -50,8 +50,14 @@ class CollectorHandler(BaseHTTPRequestHandler):
         if parsed.path == "/v1/ui/api/runs":
             self._handle_ui_runs()
             return
+        if parsed.path == "/v1/ui/api/sessions":
+            self._handle_ui_sessions()
+            return
         if parsed.path.startswith("/v1/ui/api/run/"):
             self._handle_ui_run(unquote(parsed.path.rsplit("/", 1)[-1]))
+            return
+        if parsed.path.startswith("/v1/ui/api/session/"):
+            self._handle_ui_session_details(unquote(parsed.path.rsplit("/", 1)[-1]))
             return
         if parsed.path == "/v1/ui/api/log":
             query = parse_qs(parsed.query)
@@ -130,6 +136,50 @@ class CollectorHandler(BaseHTTPRequestHandler):
             rows = all_rows(conn, "SELECT * FROM runs ORDER BY started_at DESC, id DESC")
         self._send_json([_row_to_dict(row) for row in rows])
 
+    def _handle_ui_sessions(self) -> None:
+        with connect(self.server.db_path) as conn:
+            _backfill_prompt_runs(conn)
+            sql = """
+            SELECT
+                s.id AS id,
+                s.repository_path AS repository_path,
+                s.started_at AS started_at,
+                s.ended_at AS ended_at,
+                s.final_outcome AS final_outcome,
+                s.task_summary AS task_summary,
+                1 AS is_session,
+                (SELECT COUNT(*) FROM runs r WHERE r.session_id = s.id) AS turn_count,
+                (SELECT model FROM runs r WHERE r.session_id = s.id ORDER BY turn_number DESC LIMIT 1) AS model,
+                (SELECT agent_adapter FROM runs r WHERE r.session_id = s.id ORDER BY turn_number DESC LIMIT 1) AS agent_adapter,
+                (SELECT agent_status FROM runs r WHERE r.session_id = s.id ORDER BY turn_number DESC LIMIT 1) AS agent_status,
+                (SELECT verifier_status FROM runs r WHERE r.session_id = s.id ORDER BY turn_number DESC LIMIT 1) AS verifier_status,
+                (SELECT human_status FROM runs r WHERE r.session_id = s.id ORDER BY turn_number DESC LIMIT 1) AS human_status
+            FROM sessions s
+            
+            UNION ALL
+            
+            SELECT
+                r.id AS id,
+                r.repository_path AS repository_path,
+                r.started_at AS started_at,
+                r.completed_at AS ended_at,
+                r.verifier_status AS final_outcome,
+                r.prompt AS task_summary,
+                0 AS is_session,
+                1 AS turn_count,
+                r.model AS model,
+                r.agent_adapter AS agent_adapter,
+                r.agent_status AS agent_status,
+                r.verifier_status AS verifier_status,
+                r.human_status AS human_status
+            FROM runs r
+            WHERE r.session_id IS NULL OR r.session_id = ''
+            
+            ORDER BY started_at DESC, id DESC
+            """
+            rows = all_rows(conn, sql)
+        self._send_json([_row_to_dict(row) for row in rows])
+
     def _handle_ui_run(self, run_id: str) -> None:
         with connect(self.server.db_path) as conn:
             _backfill_prompt_runs(conn)
@@ -180,6 +230,106 @@ class CollectorHandler(BaseHTTPRequestHandler):
                         [run_id],
                     )
                 ],
+            }
+        self._send_json(payload)
+
+    def _handle_ui_session_details(self, session_id: str) -> None:
+        with connect(self.server.db_path) as conn:
+            _backfill_prompt_runs(conn)
+            session_row = one(conn, "SELECT * FROM sessions WHERE id=?", [session_id])
+            if session_row:
+                session_dict = _row_to_dict(session_row)
+                runs = all_rows(conn, "SELECT * FROM runs WHERE session_id=? ORDER BY turn_number ASC, started_at ASC", [session_id])
+            else:
+                run_row = one(conn, "SELECT * FROM runs WHERE id=?", [session_id])
+                if not run_row:
+                    self._send_json_error(404, "unknown session or run")
+                    return
+                run_dict = _row_to_dict(run_row)
+                session_dict = {
+                    "id": session_id,
+                    "repository_path": run_dict["repository_path"],
+                    "repository_remote_hash": None,
+                    "started_at": run_dict["started_at"],
+                    "ended_at": run_dict["completed_at"],
+                    "final_outcome": run_dict["verifier_status"],
+                    "task_summary": run_dict["prompt"][:240] if run_dict["prompt"] else ""
+                }
+                runs = [run_row]
+            
+            turns_details = []
+            all_artifacts = []
+            all_verifier_results = []
+            all_events = []
+            
+            for run in runs:
+                r_id = run["id"]
+                artifacts = [
+                    _row_to_dict(row)
+                    for row in all_rows(
+                        conn,
+                        "SELECT * FROM artifacts WHERE run_id=? ORDER BY artifact_type, path",
+                        [r_id],
+                    )
+                ] + _event_artifacts(conn, r_id)
+                
+                verifier_results = [
+                    _row_to_dict(row)
+                    for row in all_rows(
+                        conn,
+                        "SELECT * FROM verifier_results WHERE run_id=? ORDER BY started_at, verifier_name",
+                        [r_id],
+                    )
+                ]
+                
+                events = [
+                    _event_to_dict(row)
+                    for row in all_rows(
+                        conn,
+                        """
+                        SELECT *
+                        FROM events
+                        WHERE run_id=?
+                        ORDER BY COALESCE(sequence_number, rowid), rowid
+                        """,
+                        [r_id],
+                    )
+                ]
+                
+                outputs = _agent_outputs(conn, r_id)
+                trace = _reasoning_trace(conn, r_id)
+                calls = _tool_calls(conn, r_id)
+                
+                human_reviews = [
+                    _row_to_dict(row)
+                    for row in all_rows(
+                        conn,
+                        "SELECT * FROM human_reviews WHERE run_id=? ORDER BY reviewed_at DESC, rowid DESC",
+                        [r_id],
+                    )
+                ]
+                
+                turns_details.append({
+                    "run": _row_to_dict(run),
+                    "artifacts": artifacts,
+                    "verifier_results": verifier_results,
+                    "events": events,
+                    "agent_outputs": outputs,
+                    "reasoning_trace": trace,
+                    "tool_calls": calls,
+                    "human_reviews": human_reviews
+                })
+                
+                all_artifacts.extend(artifacts)
+                all_verifier_results.extend(verifier_results)
+                all_events.extend(events)
+            
+            payload = {
+                "session": session_dict,
+                "turns": turns_details,
+                "all_artifacts": all_artifacts,
+                "all_verifier_results": all_verifier_results,
+                "all_events": all_events
             }
         self._send_json(payload)
 
