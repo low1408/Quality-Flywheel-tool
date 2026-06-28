@@ -164,6 +164,7 @@ button {
 .icon-button:focus-visible,
 .tab-button:focus-visible,
 .run-card:focus-visible,
+.run-delete-button:focus-visible,
 .event-row:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
@@ -369,8 +370,16 @@ button {
   background: transparent;
 }
 
-.run-card {
+.run-card-row {
   width: 100%;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 34px;
+  align-items: start;
+  gap: 6px;
+}
+
+.run-card {
+  min-width: 0;
   display: grid;
   gap: 8px;
   padding: 11px;
@@ -379,6 +388,33 @@ button {
   background: var(--card-bg);
   border: 1px solid var(--border-soft);
   border-radius: 8px;
+}
+
+.run-delete-button {
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  color: var(--red);
+  background: hsl(0 0% 100% / 0.78);
+  border: 1px solid var(--border-soft);
+  border-radius: 7px;
+}
+
+.run-delete-button:hover {
+  border-color: hsl(0 72% 44%);
+  background: hsl(0 78% 94% / 0.95);
+}
+
+.run-delete-button:disabled {
+  cursor: wait;
+  opacity: 0.56;
+}
+
+.run-delete-button svg {
+  width: 16px;
+  height: 16px;
+  fill: currentColor;
 }
 
 .run-card:hover,

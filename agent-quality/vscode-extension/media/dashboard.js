@@ -224,7 +224,11 @@
     } else if (action === "saveReview") {
       saveReviewNow();
     } else if (action === "deleteChat") {
-      deleteSelectedChat();
+      deleteSelectedChat(target.dataset.chatId);
+    } else if (action === "copyTranscript") {
+      copyTranscript("full");
+    } else if (action === "copyCompactTranscript") {
+      copyTranscript("compact");
     } else if (action === "closeModal") {
       closeModal();
     }
@@ -379,18 +383,38 @@
         run.model || "",
         run.turn_count > 1 ? `${run.turn_count} turns` : ""
       ].filter(Boolean).join(" - ");
+      const deleteButton = vscode && state.viewMode === "chats"
+        ? `
+          <button
+            type="button"
+            class="run-delete-button"
+            data-action="deleteChat"
+            data-chat-id="${escapeAttr(run.id)}"
+            aria-label="Delete chat"
+            title="Delete chat"
+            ${state.deleting ? "disabled" : ""}
+          >
+            <svg aria-hidden="true" viewBox="0 0 24 24" focusable="false">
+              <path d="M9 3h6l1 2h4v2H4V5h4l1-2Zm-2 6h10l-.7 11H7.7L7 9Zm3 2v7h2v-7h-2Zm4 0v7h2v-7h-2Z"></path>
+            </svg>
+          </button>
+        `
+        : "";
       return `
-        <button type="button" class="run-card${active}" data-action="selectRun" data-run-id="${escapeAttr(run.id)}">
-          <span class="run-card-main">
-            <span class="run-title">${escapeHtml(prompt)}</span>
-            ${statusChip(run.verifier_status || "unverified")}
-          </span>
-          ${meta ? `<span class="run-meta">${escapeHtml(meta)}</span>` : ""}
-          <span class="status-row">
-            ${statusChip(run.agent_status || "agent_unknown")}
-            ${statusChip(run.human_status || "not_reviewed")}
-          </span>
-        </button>
+        <div class="run-card-row">
+          <button type="button" class="run-card${active}" data-action="selectRun" data-run-id="${escapeAttr(run.id)}">
+            <span class="run-card-main">
+              <span class="run-title">${escapeHtml(prompt)}</span>
+              ${statusChip(run.verifier_status || "unverified")}
+            </span>
+            ${meta ? `<span class="run-meta">${escapeHtml(meta)}</span>` : ""}
+            <span class="status-row">
+              ${statusChip(run.agent_status || "agent_unknown")}
+              ${statusChip(run.human_status || "not_reviewed")}
+            </span>
+          </button>
+          ${deleteButton}
+        </div>
       `;
     }).join("");
   }
@@ -470,6 +494,8 @@
           </div>
           <div class="detail-actions">
             ${deleteChatButton}
+            <button type="button" class="button ghost" data-action="copyTranscript">Copy Chat</button>
+            <button type="button" class="button ghost" data-action="copyCompactTranscript">Copy Compact</button>
             <button type="button" class="button ghost" data-action="openDiff">Open Diff</button>
             <button type="button" class="button primary" data-action="setTab" data-tab="review">Review</button>
           </div>
@@ -832,8 +858,8 @@
     showModal("Diff", `aq diff ${runId}`);
   }
 
-  async function deleteSelectedChat() {
-    const chatId = state.selectedRunId;
+  async function deleteSelectedChat(chatId) {
+    chatId = chatId || state.selectedRunId;
     if (!vscode || state.viewMode !== "chats" || !chatId || state.deleting) {
       return;
     }
@@ -863,6 +889,38 @@
       renderDetail();
       setSync("Error");
       showModal("Delete Chat Failed", error.message || String(error));
+    }
+  }
+
+  async function copyTranscript(mode) {
+    if (!state.details) {
+      return;
+    }
+    const isCompact = mode === "compact";
+    const text = buildTranscriptMarkdown(state.details, {
+      compact: isCompact,
+      textLimit: isCompact ? 6000 : 60000,
+      toolLimit: isCompact ? 2500 : 12000
+    });
+    setSync("Copying");
+    try {
+      if (vscode) {
+        await request("copyText", {
+          text,
+          label: isCompact ? "compact chat transcript" : "chat transcript"
+        });
+      } else if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        showModal(isCompact ? "Compact Chat Transcript" : "Chat Transcript", text);
+        setSync("Idle");
+        return;
+      }
+      setSync("Copied");
+      window.setTimeout(() => setSync("Idle"), 1400);
+    } catch (error) {
+      setSync("Copy failed");
+      showModal("Copy failed", error.message || String(error));
     }
   }
 
@@ -1011,6 +1069,105 @@
         <pre class="trace-content">${escapeHtml(compact(text, 12000))}</pre>
       </div>
     `;
+  }
+
+  function buildTranscriptMarkdown(details, options) {
+    const turns = details.turns || [{
+      run: details.run,
+      agent_outputs: details.agent_outputs || [],
+      reasoning_trace: details.reasoning_trace || [],
+      tool_calls: details.tool_calls || [],
+      verifier_results: details.verifier_results || [],
+      human_reviews: details.human_reviews || []
+    }];
+    const subject = details.session || details.run || {};
+    const lines = [
+      "# Agent Quality Chat Transcript",
+      "",
+      `- Export: ${options.compact ? "compact" : "full bounded"}`,
+      `- Chat ID: ${subject.id || "n/a"}`,
+      `- Repository: ${subject.repository_path || "n/a"}`,
+      `- Started: ${formatDate(subject.started_at)}`,
+      `- Ended: ${formatDate(subject.ended_at || subject.completed_at)}`,
+      `- Turns: ${turns.length}`,
+      "",
+      "> Note: this export includes captured prompts, assistant outputs, emitted reasoning summaries, and tool calls. Private chain-of-thought is not available to Agent Quality.",
+      ""
+    ];
+
+    turns.forEach((turn, index) => {
+      const run = turn.run || {};
+      lines.push(`## Turn ${index + 1}`);
+      lines.push("");
+      lines.push(`- Run ID: ${run.id || "n/a"}`);
+      lines.push(`- Model: ${run.model || "n/a"}`);
+      lines.push(`- Agent: ${run.agent_adapter || "n/a"}`);
+      lines.push(`- Status: ${[run.agent_status, run.verifier_status, run.human_status].filter(Boolean).join(" / ") || "n/a"}`);
+      lines.push("");
+      pushSection(lines, "Prompt", run.prompt || "No prompt captured.", options.textLimit);
+
+      const outputs = turn.agent_outputs || [];
+      if (outputs.length) {
+        outputs.forEach((output, outputIndex) => {
+          const suffix = outputs.length > 1 ? ` ${outputIndex + 1}` : "";
+          pushSection(lines, `Agent output${suffix}`, output.text || "", options.textLimit);
+        });
+      } else {
+        pushSection(lines, "Agent output", "No agent output captured.", options.textLimit);
+      }
+
+      const trace = turn.reasoning_trace || [];
+      if (trace.length) {
+        lines.push("### Reasoning summaries");
+        lines.push("");
+        trace.forEach((entry, traceIndex) => {
+          lines.push(`#### ${traceIndex + 1}. ${entry.kind || "summary"}${entry.occurred_at ? ` - ${formatDate(entry.occurred_at)}` : ""}`);
+          lines.push("");
+          lines.push(fence(compact(entry.text || "", options.toolLimit)));
+          lines.push("");
+        });
+      }
+
+      const calls = turn.tool_calls || [];
+      if (calls.length) {
+        lines.push("### Tool calls");
+        lines.push("");
+        calls.forEach((call, callIndex) => {
+          lines.push(`#### ${callIndex + 1}. ${call.tool_name || "tool"}`);
+          lines.push("");
+          lines.push(`- Category: ${call.tool_category || "n/a"}`);
+          lines.push(`- Status: ${call.status || "n/a"}`);
+          lines.push(`- Occurred: ${formatDate(call.occurred_at)}`);
+          pushSection(lines, "Input", stringifyForTranscript(call.input), options.toolLimit);
+          pushSection(lines, "Output", stringifyForTranscript(call.output), options.toolLimit);
+        });
+      }
+    });
+
+    return lines.join("\n").replace(/\n{4,}/g, "\n\n\n").trim() + "\n";
+  }
+
+  function pushSection(lines, title, content, limit) {
+    lines.push(`### ${title}`);
+    lines.push("");
+    lines.push(fence(compact(content || "n/a", limit)));
+    lines.push("");
+  }
+
+  function fence(content) {
+    const text = String(content || "");
+    const marker = text.includes("```") ? "````" : "```";
+    return `${marker}\n${text}\n${marker}`;
+  }
+
+  function stringifyForTranscript(value) {
+    if (value === null || value === undefined || value === "") {
+      return "n/a";
+    }
+    if (typeof value === "string") {
+      return value;
+    }
+    return JSON.stringify(value, null, 2);
   }
 
   function eventSummary(event) {
