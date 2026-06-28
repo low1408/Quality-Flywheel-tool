@@ -604,6 +604,8 @@ function startFlywheelAnalysis(folder, runIds, judgeCommand, webview) {
 }
 
 const MAX_FILE_PREVIEW_BYTES = 1_000_000;
+const AQ_COMMAND_MAX_BUFFER = 10 * 1024 * 1024;
+const DASHBOARD_QUERY_MAX_BUFFER = 10 * 1024 * 1024;
 
 const DASHBOARD_DB_SCRIPT = String.raw`
 import datetime
@@ -1214,9 +1216,6 @@ elif action == "session_details":
             runs = [run_row]
         
         turns_details = []
-        all_artifacts = []
-        all_verifier_results = []
-        all_events = []
         
         for run in runs:
             r_id = run["id"]
@@ -1261,16 +1260,9 @@ elif action == "session_details":
                 "human_reviews": human_reviews
             })
             
-            all_artifacts.extend(artifacts)
-            all_verifier_results.extend(verifier_results)
-            all_events.extend(events)
-            
         emit({
             "session": session_dict,
-            "turns": turns_details,
-            "all_artifacts": all_artifacts,
-            "all_verifier_results": all_verifier_results,
-            "all_events": all_events
+            "turns": turns_details
         })
 elif action == "flywheel_candidates":
     if not os.path.exists(db_path):
@@ -1455,7 +1447,7 @@ function dashboardDbQuery(folder, action, payload) {
       env: commandEnv(folder),
       timeout: 15000,
       windowsHide: true,
-      maxBuffer: 10 * 1024 * 1024
+      maxBuffer: DASHBOARD_QUERY_MAX_BUFFER
     }, (err, stdout, stderr) => {
       if (err) {
         reject(new Error((stderr || "").trim() || err.message));
@@ -1618,7 +1610,8 @@ function execAq(args, folder) {
       cwd: projectRootPath(folder),
       env: commandEnv(folder),
       timeout: 15000,
-      windowsHide: true
+      windowsHide: true,
+      maxBuffer: AQ_COMMAND_MAX_BUFFER
     }, (err, stdout, stderr) => {
       if (err) {
         const detail = stderr.trim() || err.message;

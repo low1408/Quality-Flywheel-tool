@@ -2,7 +2,7 @@
   "name": "agent-quality-vscode",
   "displayName": "Agent Quality",
   "description": "VS Code commands and views for the Agent Quality local sidecar.",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "publisher": "agent-quality",
   "license": "MIT",
   "repository": {

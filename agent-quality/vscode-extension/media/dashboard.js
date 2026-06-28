@@ -523,18 +523,28 @@
 
   function renderActiveTab(details) {
     if (state.activeTab === "verifiers") {
-      return renderVerifiers(details.verifier_results || details.all_verifier_results || []);
+      return renderVerifiers(detailItems(details, "verifier_results", "all_verifier_results"));
     }
     if (state.activeTab === "artifacts") {
-      return renderArtifacts(details.artifacts || details.all_artifacts || []);
+      return renderArtifacts(detailItems(details, "artifacts", "all_artifacts"));
     }
     if (state.activeTab === "timeline") {
-      return renderTimeline(details.events || details.all_events || []);
+      return renderTimeline(detailItems(details, "events", "all_events"));
     }
     if (state.activeTab === "review") {
       return renderReview(details);
     }
     return renderOverview(details);
+  }
+
+  function detailItems(details, key, legacyKey) {
+    if (Array.isArray(details[key])) {
+      return details[key];
+    }
+    if (Array.isArray(details.turns)) {
+      return details.turns.flatMap((turn) => Array.isArray(turn[key]) ? turn[key] : []);
+    }
+    return Array.isArray(details[legacyKey]) ? details[legacyKey] : [];
   }
 
   function renderOverview(details) {
@@ -849,7 +859,7 @@
       await request("openDiff", { run_id: runId });
       return;
     }
-    const artifacts = state.details.artifacts || state.details.all_artifacts || [];
+    const artifacts = detailItems(state.details, "artifacts", "all_artifacts");
     const patch = artifacts.find((artifact) => ["final_patch", "diff", "patch"].includes(artifact.artifact_type));
     if (patch && patch.path) {
       await previewPath(patch.path);
