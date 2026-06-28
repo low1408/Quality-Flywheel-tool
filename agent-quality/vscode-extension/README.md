@@ -1,5 +1,7 @@
 # Agent Quality VS Code Extension
 
+The extension includes separate run and flywheel webviews. To enable flywheel analysis, install the sibling `kimi_coding_agent_flywheel` package so `aq-flywheel` is available and configure `agentQuality.flywheelJudgeCommand` as a command argument array. The judge receives an egress-redacted prompt on stdin and must return the `LLMJudgeDiagnoser` JSON object on stdout.
+
 This extension provides a thin VS Code interface over the `aq` CLI.
 
 ## Features

@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Agent Quality Flywheel</title>
+    <link rel="stylesheet" href="./flywheel.css">
+    <script src="./flywheel.js" defer></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>Quality Flywheel</h1>
+        <p>Diagnose and cluster persisted Agent Quality runs.</p>
+      </div>
+      <button class="secondary" data-action="refresh">Refresh</button>
+    </header>
+    <main>
+      <section class="panel">
+        <div class="section-head">
+          <div>
+            <h2>New analysis</h2>
+            <p>Select completed runs. Known failure signals are selected automatically.</p>
+          </div>
+          <div class="actions">
+            <button class="secondary" data-action="selectDefaults">Select flagged</button>
+            <button id="analyzeButton" data-action="analyze">Run analysis</button>
+          </div>
+        </div>
+        <div id="progress" class="progress" aria-live="polite">Idle</div>
+        <div id="candidates" class="candidate-list"></div>
+      </section>
+
+      <section class="history-layout">
+        <aside class="panel history-panel">
+          <h2>Analysis history</h2>
+          <div id="analyses" class="analysis-list"></div>
+        </aside>
+        <section id="details" class="panel details-panel">
+          <div class="empty">Select an analysis to inspect its clusters.</div>
+        </section>
+      </section>
+    </main>
+  </body>
+</html>

@@ -2,7 +2,7 @@
   "name": "agent-quality-vscode",
   "displayName": "Agent Quality",
   "description": "VS Code commands and views for the Agent Quality local sidecar.",
-  "version": "0.1.1",
+  "version": "0.1.4",
   "publisher": "agent-quality",
   "license": "MIT",
   "repository": {
@@ -31,6 +31,7 @@
     "onCommand:agentQuality.reportSummary",
     "onCommand:agentQuality.refreshRuns",
     "onCommand:agentQuality.showDashboard",
+    "onCommand:agentQuality.showFlywheel",
     "onCommand:agentQuality.showRun",
     "onCommand:agentQuality.diffRun",
     "onCommand:agentQuality.traceRun",
@@ -99,6 +100,11 @@
         "icon": "$(dashboard)"
       },
       {
+        "command": "agentQuality.showFlywheel",
+        "title": "Agent Quality: Open Flywheel",
+        "icon": "$(beaker)"
+      },
+      {
         "command": "agentQuality.showRun",
         "title": "Agent Quality: Show Run",
         "icon": "$(eye)"
@@ -127,9 +133,14 @@
           "group": "navigation@1"
         },
         {
-          "command": "agentQuality.refreshRuns",
+          "command": "agentQuality.showFlywheel",
           "when": "view == agentQuality.runs",
           "group": "navigation@2"
+        },
+        {
+          "command": "agentQuality.refreshRuns",
+          "when": "view == agentQuality.runs",
+          "group": "navigation@3"
         }
       ],
       "view/item/context": [
@@ -214,6 +225,25 @@
           "type": "string",
           "default": "",
           "description": "Optional bearer token for aq serve-collector."
+        },
+        "agentQuality.flywheelCommand": {
+          "type": "string",
+          "default": "aq-flywheel",
+          "description": "Command used to run the separately installed Kimi analysis worker."
+        },
+        "agentQuality.flywheelJudgeCommand": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Argument array for the external LLM judge command. The redacted prompt is sent on stdin and diagnosis JSON must be returned on stdout."
+        },
+        "agentQuality.flywheelMinClusterSize": {
+          "type": "integer",
+          "default": 2,
+          "minimum": 2,
+          "description": "Minimum number of diagnosed failures required to form a flywheel cluster."
         }
       }
     }

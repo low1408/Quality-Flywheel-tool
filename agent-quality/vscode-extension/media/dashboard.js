@@ -52,6 +52,11 @@
     selectedRunId: initialRunId,
     viewMode: "chats"
   };
+  const sidebarResize = {
+    max: 720,
+    min: 260,
+    storageKey: "agentQuality.sidebarWidth"
+  };
   const elements = {};
 
   document.addEventListener("DOMContentLoaded", init);
@@ -66,6 +71,8 @@
     elements.chatFilter = document.getElementById("chatFilter");
     elements.agentFilter = document.getElementById("agentFilter");
     elements.statusFilter = document.getElementById("statusFilter");
+    elements.workspace = document.querySelector(".workspace");
+    elements.sidebarResizer = document.getElementById("sidebarResizer");
     elements.detailPane = document.getElementById("detailPane");
     elements.modalBackdrop = document.getElementById("modalBackdrop");
     elements.modalTitle = document.getElementById("modalTitle");
@@ -76,7 +83,100 @@
     document.addEventListener("input", handleInput);
     document.addEventListener("change", handleChange);
     window.addEventListener("message", handleHostMessage);
+    initSidebarResize();
     loadRuns();
+  }
+
+  function initSidebarResize() {
+    if (!elements.workspace || !elements.sidebarResizer) {
+      return;
+    }
+    const savedWidth = Number(window.localStorage.getItem(sidebarResize.storageKey));
+    if (Number.isFinite(savedWidth) && savedWidth > 0) {
+      setSidebarWidth(savedWidth);
+    }
+    elements.sidebarResizer.addEventListener("pointerdown", startSidebarResize);
+    elements.sidebarResizer.addEventListener("keydown", handleSidebarResizeKeydown);
+  }
+
+  function startSidebarResize(event) {
+    if (event.button !== 0 || !elements.workspace) {
+      return;
+    }
+    event.preventDefault();
+    elements.sidebarResizer.setPointerCapture(event.pointerId);
+    elements.workspace.classList.add("is-resizing");
+
+    const move = (moveEvent) => {
+      setSidebarWidth(widthFromPointer(moveEvent.clientX));
+    };
+    const stop = () => {
+      elements.workspace.classList.remove("is-resizing");
+      elements.sidebarResizer.removeEventListener("pointermove", move);
+      elements.sidebarResizer.removeEventListener("pointerup", stop);
+      elements.sidebarResizer.removeEventListener("pointercancel", stop);
+      persistSidebarWidth();
+    };
+
+    elements.sidebarResizer.addEventListener("pointermove", move);
+    elements.sidebarResizer.addEventListener("pointerup", stop);
+    elements.sidebarResizer.addEventListener("pointercancel", stop);
+  }
+
+  function handleSidebarResizeKeydown(event) {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
+      return;
+    }
+    event.preventDefault();
+    const current = currentSidebarWidth();
+    const step = event.shiftKey ? 40 : 16;
+    let next = current;
+    if (event.key === "ArrowLeft") {
+      next = current - step;
+    } else if (event.key === "ArrowRight") {
+      next = current + step;
+    } else if (event.key === "Home") {
+      next = sidebarResize.min;
+    } else if (event.key === "End") {
+      next = maxSidebarWidth();
+    }
+    setSidebarWidth(next);
+    persistSidebarWidth();
+  }
+
+  function widthFromPointer(clientX) {
+    const rect = elements.workspace.getBoundingClientRect();
+    return clientX - rect.left;
+  }
+
+  function setSidebarWidth(width) {
+    const next = clamp(width, sidebarResize.min, maxSidebarWidth());
+    elements.workspace.style.setProperty("--rail-width", `${Math.round(next)}px`);
+    elements.sidebarResizer.setAttribute("aria-valuemin", String(sidebarResize.min));
+    elements.sidebarResizer.setAttribute("aria-valuemax", String(maxSidebarWidth()));
+    elements.sidebarResizer.setAttribute("aria-valuenow", String(Math.round(next)));
+  }
+
+  function currentSidebarWidth() {
+    const value = getComputedStyle(elements.workspace).getPropertyValue("--rail-width");
+    const parsed = Number.parseFloat(value);
+    return Number.isFinite(parsed) ? parsed : 360;
+  }
+
+  function maxSidebarWidth() {
+    const workspaceWidth = elements.workspace ? elements.workspace.getBoundingClientRect().width : 0;
+    if (!workspaceWidth) {
+      return sidebarResize.max;
+    }
+    return Math.max(sidebarResize.min, Math.min(sidebarResize.max, workspaceWidth - 280));
+  }
+
+  function persistSidebarWidth() {
+    window.localStorage.setItem(sidebarResize.storageKey, String(Math.round(currentSidebarWidth())));
+  }
+
+  function clamp(value, min, max) {
+    return Math.min(Math.max(value, min), max);
   }
 
   function handleHostMessage(event) {

@@ -9,6 +9,7 @@ let output;
 let statusItem;
 let collectorProcess;
 let runsProvider;
+const flywheelProcesses = new Map();
 
 const DELETE_CHAT_CONFIRMATION = "Delete Chat";
 
@@ -34,6 +35,7 @@ function activate(context) {
   register(context, "agentQuality.reportSummary", reportSummary);
   register(context, "agentQuality.refreshRuns", () => runsProvider.refresh());
   register(context, "agentQuality.showDashboard", () => DashboardPanel.show(context));
+  register(context, "agentQuality.showFlywheel", () => FlywheelPanel.show(context));
   register(context, "agentQuality.showRun", (item) => showDashboardRun(context, item, "overview"));
   register(context, "agentQuality.diffRun", (item) => showDashboardRun(context, item, "artifacts"));
   register(context, "agentQuality.traceRun", (item) => showDashboardRun(context, item, "timeline"));
@@ -402,6 +404,194 @@ class DashboardPanel {
   }
 }
 
+class FlywheelPanel {
+  static currentPanel;
+
+  static show(context) {
+    if (FlywheelPanel.currentPanel) {
+      FlywheelPanel.currentPanel.panel.reveal(vscode.ViewColumn.One);
+      return;
+    }
+    const panel = vscode.window.createWebviewPanel(
+      "agentQualityFlywheel",
+      "Agent Quality Flywheel",
+      vscode.ViewColumn.One,
+      {
+        enableScripts: true,
+        localResourceRoots: [vscode.Uri.joinPath(context.extensionUri, "media")]
+      }
+    );
+    FlywheelPanel.currentPanel = new FlywheelPanel(context, panel);
+  }
+
+  constructor(context, panel) {
+    this.context = context;
+    this.panel = panel;
+    this.panel.webview.html = this.html();
+    this.panel.webview.onDidReceiveMessage((message) => this.handleMessage(message), undefined, context.subscriptions);
+    this.panel.onDidDispose(() => {
+      FlywheelPanel.currentPanel = undefined;
+    }, undefined, context.subscriptions);
+  }
+
+  html() {
+    const mediaRoot = vscode.Uri.joinPath(this.context.extensionUri, "media");
+    const htmlPath = vscode.Uri.joinPath(mediaRoot, "flywheel.html");
+    const cssUri = this.panel.webview.asWebviewUri(vscode.Uri.joinPath(mediaRoot, "flywheel.css"));
+    const jsUri = this.panel.webview.asWebviewUri(vscode.Uri.joinPath(mediaRoot, "flywheel.js"));
+    let html = fs.readFileSync(htmlPath.fsPath, "utf8");
+    html = html.replace("./flywheel.css", String(cssUri));
+    html = html.replace("./flywheel.js", String(jsUri));
+    return html;
+  }
+
+  async handleMessage(message) {
+    try {
+      const folder = this.workspaceFolder();
+      if (message.command === "loadCandidates") {
+        const runs = await dashboardDbQuery(folder, "flywheel_candidates", {});
+        this.reply(message, { command: "candidatesLoaded", runs });
+        return;
+      }
+      if (message.command === "loadAnalyses") {
+        const analyses = await dashboardDbQuery(folder, "flywheel_analyses", {});
+        this.reply(message, { command: "analysesLoaded", analyses });
+        return;
+      }
+      if (message.command === "loadAnalysisDetails") {
+        const details = await dashboardDbQuery(folder, "flywheel_analysis_details", { analysis_id: message.analysis_id });
+        this.reply(message, { command: "analysisDetailsLoaded", ...details });
+        return;
+      }
+      if (message.command === "startAnalysis") {
+        const runIds = Array.isArray(message.run_ids) ? [...new Set(message.run_ids.filter((id) => typeof id === "string" && id))] : [];
+        if (!runIds.length) {
+          throw new Error("Select at least one run.");
+        }
+        const judgeCommand = getConfig().get("flywheelJudgeCommand");
+        if (!Array.isArray(judgeCommand) || !judgeCommand.length || judgeCommand.some((arg) => typeof arg !== "string" || !arg)) {
+          throw new Error("Configure agentQuality.flywheelJudgeCommand as a non-empty argument array first.");
+        }
+        const confirmation = await vscode.window.showWarningMessage(
+          `Analyze ${runIds.length} run${runIds.length === 1 ? "" : "s"} with ${path.basename(judgeCommand[0])}?`,
+          {
+            modal: true,
+            detail: "Persisted payloads are redacted again before each prompt is sent to the external judge command."
+          },
+          "Run Analysis"
+        );
+        if (confirmation !== "Run Analysis") {
+          this.reply(message, { command: "analysisStartCancelled", started: false });
+          return;
+        }
+        await startFlywheelAnalysis(folder, runIds, judgeCommand, this.panel.webview);
+        this.reply(message, { command: "analysisStarted", started: true });
+        return;
+      }
+      if (message.command === "openRun") {
+        if (!message.run_id) {
+          throw new Error("missing run ID");
+        }
+        DashboardPanel.show(this.context, message.run_id, "overview");
+        this.reply(message, { command: "runOpened", ok: true });
+        return;
+      }
+      this.replyError(message, `unknown command: ${message.command}`);
+    } catch (err) {
+      this.replyError(message, err.message || String(err));
+    }
+  }
+
+  workspaceFolder() {
+    const folder = firstWorkspaceFolder();
+    if (!folder) {
+      throw new Error("Open a workspace folder first.");
+    }
+    return folder;
+  }
+
+  reply(message, payload) {
+    this.panel.webview.postMessage({ requestId: message.requestId, ...(payload || {}) });
+  }
+
+  replyError(message, error) {
+    this.panel.webview.postMessage({ requestId: message.requestId, error });
+  }
+}
+
+function startFlywheelAnalysis(folder, runIds, judgeCommand, webview) {
+  const workspaceKey = projectRootPath(folder);
+  if (flywheelProcesses.has(workspaceKey)) {
+    throw new Error("A flywheel analysis is already running for this workspace.");
+  }
+  const configured = getConfig().get("flywheelCommand") || "aq-flywheel";
+  const commandLine = splitCommandLine(configured);
+  if (!commandLine.length) {
+    throw new Error("agentQuality.flywheelCommand is empty.");
+  }
+  const args = [
+    ...commandLine.slice(1),
+    "analyze",
+    "--db",
+    path.join(agentQualityHome(folder), "quality.sqlite3"),
+    "--min-cluster-size",
+    String(getConfig().get("flywheelMinClusterSize") || 2),
+    "--judge-command-json",
+    JSON.stringify(judgeCommand)
+  ];
+  for (const runId of runIds) {
+    args.push("--run-id", runId);
+  }
+  output.show(true);
+  output.appendLine("");
+  output.appendLine(`[Flywheel analysis: ${runIds.length} runs]`);
+  const displayArgs = args.map((arg, index) => args[index - 1] === "--judge-command-json" ? "[configured]" : arg);
+  output.appendLine(`$ ${quoteArgs([commandLine[0], ...displayArgs])}`);
+  statusItem.text = "$(sync~spin) Agent Quality Flywheel";
+
+  const child = cp.spawn(commandLine[0], args, {
+    cwd: workspaceKey,
+    env: commandEnv(folder),
+    shell: false,
+    windowsHide: true
+  });
+  flywheelProcesses.set(workspaceKey, child);
+  let stdoutBuffer = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk) => {
+    const text = chunk.toString();
+    output.append(text);
+    stdoutBuffer += text;
+    const lines = stdoutBuffer.split(/\r?\n/);
+    stdoutBuffer = lines.pop() || "";
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        webview.postMessage({ command: "analysisEvent", event: JSON.parse(line) });
+      } catch {
+        // Non-JSON worker output remains visible in the output channel.
+      }
+    }
+  });
+  child.stderr.on("data", (chunk) => {
+    const text = chunk.toString();
+    stderr += text;
+    output.append(text);
+  });
+  child.on("error", (err) => {
+    flywheelProcesses.delete(workspaceKey);
+    statusItem.text = collectorProcess ? "$(radio-tower) Agent Quality" : "$(pulse) Agent Quality";
+    webview.postMessage({ command: "analysisFinished", error: err.message });
+    vscode.window.showErrorMessage(`Flywheel analysis failed to start: ${err.message}`);
+  });
+  child.on("exit", (code) => {
+    flywheelProcesses.delete(workspaceKey);
+    statusItem.text = collectorProcess ? "$(radio-tower) Agent Quality" : "$(pulse) Agent Quality";
+    const error = code === 0 ? undefined : (stderr.trim().split(/\r?\n/).slice(-1)[0] || `worker exited with code ${code}`);
+    webview.postMessage({ command: "analysisFinished", code, error });
+  });
+}
+
 const MAX_FILE_PREVIEW_BYTES = 1_000_000;
 
 const DASHBOARD_DB_SCRIPT = String.raw`
@@ -423,14 +613,86 @@ def emit(value):
     print(json.dumps(value, sort_keys=True))
 
 
+DASHBOARD_TEXT_LIMIT = 12000
+DASHBOARD_OUTPUT_LIMIT = 60000
+DASHBOARD_LIST_LIMIT = 200
+
+
+def compact_text(value, limit=DASHBOARD_TEXT_LIMIT):
+    text = str(value)
+    if len(text) <= limit:
+        return text
+    omitted = len(text) - limit
+    return text[:limit] + f"\n\n[truncated: {omitted} chars omitted]"
+
+
+def compact_value(value, text_limit=DASHBOARD_TEXT_LIMIT):
+    if isinstance(value, str):
+        return compact_text(value, text_limit)
+    if isinstance(value, list):
+        items = [compact_value(item, text_limit) for item in value[:DASHBOARD_LIST_LIMIT]]
+        if len(value) > DASHBOARD_LIST_LIMIT:
+            items.append({"_truncated_items": len(value) - DASHBOARD_LIST_LIMIT})
+        return items
+    if isinstance(value, dict):
+        return {str(key): compact_value(item, text_limit) for key, item in value.items()}
+    return value
+
+
 def connect():
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
     return conn
+
+
+def ensure_flywheel_schema(conn):
+    analysis_columns = {row["name"] for row in conn.execute("PRAGMA table_info(analysis_runs)")}
+    additions = {
+        "completed_at": "TEXT",
+        "error_message": "TEXT",
+        "selected_run_count": "INTEGER NOT NULL DEFAULT 0",
+        "failure_count": "INTEGER NOT NULL DEFAULT 0",
+        "cluster_count": "INTEGER NOT NULL DEFAULT 0",
+    }
+    for name, definition in additions.items():
+        if name not in analysis_columns:
+            conn.execute(f"ALTER TABLE analysis_runs ADD COLUMN {name} {definition}")
+    failure_columns = {row["name"] for row in conn.execute("PRAGMA table_info(failure_instances)")}
+    if "analysis_id" not in failure_columns:
+        conn.execute("ALTER TABLE failure_instances ADD COLUMN analysis_id TEXT REFERENCES analysis_runs(id) ON DELETE CASCADE")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS analysis_inputs (
+            analysis_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            failure_count INTEGER NOT NULL DEFAULT 0,
+            error_type TEXT,
+            error_message TEXT,
+            PRIMARY KEY (analysis_id, run_id),
+            FOREIGN KEY(analysis_id) REFERENCES analysis_runs(id) ON DELETE CASCADE,
+            FOREIGN KEY(run_id) REFERENCES runs(id) ON DELETE CASCADE
+        )
+    """)
+    conn.commit()
 
 
 def row_to_dict(row):
     return {key: row[key] for key in row.keys()}
+
+
+def run_to_dict(row):
+    data = row_to_dict(row)
+    if data.get("prompt"):
+        data["prompt"] = compact_text(data["prompt"], DASHBOARD_OUTPUT_LIMIT)
+    return data
+
+
+def run_list_dict(row):
+    data = row_to_dict(row)
+    if data.get("prompt"):
+        data["prompt"] = compact_text(data["prompt"], 240)
+    return data
 
 
 def json_or_value(value):
@@ -443,8 +705,10 @@ def json_or_value(value):
 def event_to_dict(row):
     data = row_to_dict(row)
     for key in ("normalized_payload", "source_payload_sanitized", "provider_extensions", "redaction_findings"):
-        if data.get(key):
-            data[key + "_json"] = json_or_value(data[key])
+        raw = data.get(key)
+        if raw:
+            data[key + "_json"] = compact_value(json_or_value(raw))
+            data[key] = compact_text(raw, 2000)
     return data
 
 
@@ -633,7 +897,7 @@ def agent_outputs(conn, run_id):
                 "event_id": row["id"],
                 "sequence_number": row["sequence_number"],
                 "occurred_at": row["occurred_at"] or row["observed_at"],
-                "text": str(text),
+                "text": compact_text(text, DASHBOARD_OUTPUT_LIMIT),
                 "file_links": links,
             })
     return outputs
@@ -653,7 +917,7 @@ def reasoning_trace(conn, run_id):
             "event_id": row["id"],
             "occurred_at": row["occurred_at"] or row["observed_at"],
             "kind": event_payload.get("reasoning_kind") or "summary",
-            "text": str(event_payload["reasoning"]),
+            "text": compact_text(event_payload["reasoning"]),
         })
     return trace
 
@@ -689,18 +953,20 @@ def tool_calls(conn, run_id):
                 "tool_name": tool_name or row["tool_category"] or "tool",
                 "tool_category": tool_category,
                 "status": row["status"],
-                "input": event_payload.get("tool_input", hook.get("tool_input", hook.get("toolInput"))),
+                "input": compact_value(event_payload.get("tool_input", hook.get("tool_input", hook.get("toolInput")))),
                 "output": None,
             }
             by_id[key] = call
             calls.append(call)
         elif call.get("input") is None:
-            call["input"] = event_payload.get("tool_input", hook.get("tool_input", hook.get("toolInput")))
+            call["input"] = compact_value(event_payload.get("tool_input", hook.get("tool_input", hook.get("toolInput"))))
         if is_completed:
             call["status"] = row["status"] or "completed"
-            call["output"] = event_payload.get(
-                "tool_output",
-                hook.get("tool_response", hook.get("toolResponse")),
+            call["output"] = compact_value(
+                event_payload.get(
+                    "tool_output",
+                    hook.get("tool_response", hook.get("toolResponse")),
+                )
             )
     return calls
 
@@ -930,7 +1196,7 @@ if action == "runs":
     with connect() as conn:
         backfill_prompt_runs(conn)
         conn.commit()
-        emit([row_to_dict(row) for row in conn.execute("SELECT * FROM runs ORDER BY started_at DESC, id DESC")])
+        emit([run_list_dict(row) for row in conn.execute("SELECT * FROM runs ORDER BY started_at DESC, id DESC")])
 elif action == "sessions":
     if not os.path.exists(db_path):
         emit([])
@@ -963,7 +1229,7 @@ elif action == "sessions":
             r.started_at AS started_at,
             r.completed_at AS ended_at,
             r.verifier_status AS final_outcome,
-            r.prompt AS task_summary,
+            substr(COALESCE(r.prompt, ''), 1, 240) AS task_summary,
             0 AS is_session,
             1 AS turn_count,
             r.model AS model,
@@ -988,7 +1254,7 @@ elif action == "details":
         if not run:
             raise SystemExit("unknown run: " + str(run_id))
         emit({
-            "run": row_to_dict(run),
+            "run": run_to_dict(run),
             "artifacts": [
                 row_to_dict(row)
                 for row in conn.execute("SELECT * FROM artifacts WHERE run_id=? ORDER BY artifact_type, path", [run_id])
@@ -1080,7 +1346,7 @@ elif action == "session_details":
             ]
             
             turns_details.append({
-                "run": row_to_dict(run),
+                "run": run_to_dict(run),
                 "artifacts": artifacts,
                 "verifier_results": verifier_results,
                 "events": events,
@@ -1101,6 +1367,80 @@ elif action == "session_details":
             "all_verifier_results": all_verifier_results,
             "all_events": all_events
         })
+elif action == "flywheel_candidates":
+    if not os.path.exists(db_path):
+        emit([])
+        raise SystemExit(0)
+    with connect() as conn:
+        rows = conn.execute("""
+            SELECT
+                r.id,
+                r.prompt,
+                r.started_at,
+                r.completed_at,
+                r.agent_adapter,
+                r.model,
+                r.agent_status,
+                r.verifier_status,
+                r.human_status,
+                r.lifecycle_status,
+                CASE WHEN
+                    lower(COALESCE(r.agent_status, '')) IN ('failed', 'error')
+                    OR lower(COALESCE(r.verifier_status, '')) = 'failed'
+                    OR lower(COALESCE(r.human_status, '')) IN ('partial', 'rejected', 'accepted_with_major_edits')
+                THEN 1 ELSE 0 END AS default_selected,
+                (SELECT COUNT(*) FROM events e WHERE e.run_id=r.id) AS event_count
+            FROM runs r
+            WHERE (r.completed_at IS NOT NULL OR r.lifecycle_status='closed')
+              AND EXISTS (SELECT 1 FROM events e WHERE e.run_id=r.id)
+            ORDER BY r.started_at DESC, r.id DESC
+        """).fetchall()
+        emit([run_list_dict(row) for row in rows])
+elif action == "flywheel_analyses":
+    if not os.path.exists(db_path):
+        emit([])
+        raise SystemExit(0)
+    with connect() as conn:
+        ensure_flywheel_schema(conn)
+        emit([row_to_dict(row) for row in conn.execute("SELECT * FROM analysis_runs ORDER BY created_at DESC, id DESC")])
+elif action == "flywheel_analysis_details":
+    if not os.path.exists(db_path):
+        raise SystemExit("Agent Quality database does not exist yet.")
+    analysis_id = payload.get("analysis_id")
+    with connect() as conn:
+        ensure_flywheel_schema(conn)
+        analysis = conn.execute("SELECT * FROM analysis_runs WHERE id=?", [analysis_id]).fetchone()
+        if not analysis:
+            raise SystemExit("unknown analysis: " + str(analysis_id))
+        inputs = [compact_value(row_to_dict(row)) for row in conn.execute("""
+            SELECT ai.*, r.prompt, r.started_at, r.agent_adapter, r.model,
+                   r.agent_status, r.verifier_status, r.human_status
+            FROM analysis_inputs ai
+            JOIN runs r ON r.id=ai.run_id
+            WHERE ai.analysis_id=?
+            ORDER BY r.started_at DESC, r.id DESC
+        """, [analysis_id])]
+        clusters = []
+        cluster_rows = conn.execute("""
+            SELECT DISTINCT fc.*
+            FROM failure_clusters fc
+            JOIN failure_cluster_memberships m ON m.cluster_id=fc.id
+            WHERE m.analysis_id=?
+            ORDER BY fc.occurrence_count DESC, fc.id
+        """, [analysis_id]).fetchall()
+        for cluster_row in cluster_rows:
+            cluster = row_to_dict(cluster_row)
+            cluster["provider_extensions_json"] = json_or_value(cluster.get("provider_extensions") or "{}")
+            cluster["affected_runs"] = [row["run_id"] for row in conn.execute(
+                "SELECT DISTINCT run_id FROM failure_cluster_memberships WHERE analysis_id=? AND cluster_id=? ORDER BY run_id",
+                [analysis_id, cluster["id"]],
+            )]
+            clusters.append(cluster)
+        failures = [row_to_dict(row) for row in conn.execute(
+            "SELECT * FROM failure_instances WHERE analysis_id=? ORDER BY severity DESC, timestamp, id",
+            [analysis_id],
+        )]
+        emit({"analysis": row_to_dict(analysis), "inputs": inputs, "clusters": clusters, "failures": failures})
 elif action == "save_review":
     if not os.path.exists(db_path):
         raise SystemExit("Agent Quality database does not exist yet.")
