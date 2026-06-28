@@ -10,7 +10,7 @@ Initialize the Agent Quality project from a fresh checkout.
 Options:
   --repo PATH          Project root to initialize. Defaults to this repository.
   --python PATH        Python executable to use. Defaults to python3.
-  --venv PATH          Virtual environment path. Defaults to <repo>/.venv.
+  --venv PATH          Virtual environment path. Defaults to ~/venvs/quality-flywheel.
   --no-venv           Do not create/use a virtual environment.
   --skip-install      Do not run pip install -e .
   --skip-smoke        Do not run CLI smoke checks.
@@ -74,7 +74,7 @@ fi
 cd "${repo}"
 
 if [[ -z "${venv_path}" ]]; then
-  venv_path="${repo}/.venv"
+  venv_path="${HOME}/venvs/quality-flywheel"
 fi
 
 if [[ ${use_venv} -eq 1 ]]; then

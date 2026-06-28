@@ -2,7 +2,7 @@
   "name": "agent-quality-vscode",
   "displayName": "Agent Quality",
   "description": "VS Code commands and views for the Agent Quality local sidecar.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "agent-quality",
   "license": "MIT",
   "repository": {
@@ -14,7 +14,7 @@
     "validate-package": "node -e \"JSON.parse(require('fs').readFileSync('package.json', 'utf8'))\""
   },
   "engines": {
-    "vscode": "^1.90.0 || ^2.0.0"
+    "vscode": "^1.90.0"
   },
   "categories": [
     "Other"

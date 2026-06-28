@@ -22,7 +22,7 @@ Or initialize the repository in one step:
 scripts/init_project.sh
 ```
 
-That creates a local virtual environment, installs `aq` in editable mode, creates `.agent-quality` config files, and runs smoke checks. Runtime smoke-test data is stored under `.agent-quality/local`.
+That creates the virtual environment at `~/venvs/quality-flywheel`, installs `aq` in editable mode, creates `.agent-quality` config files, and runs smoke checks. Pass `--venv PATH` to use a different location. Runtime smoke-test data is stored under `.agent-quality/local`.
 
 Initialize a measured project:
 

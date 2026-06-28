@@ -1,1 +1,1 @@
-run python by `source .venv/bin/activate`
+Run Python with `source ~/venvs/quality-flywheel/bin/activate`.

@@ -10,6 +10,8 @@ let statusItem;
 let collectorProcess;
 let runsProvider;
 
+const DELETE_CHAT_CONFIRMATION = "Delete Chat";
+
 function activate(context) {
   output = vscode.window.createOutputChannel("Agent Quality");
   statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
@@ -336,6 +338,29 @@ class DashboardPanel {
         const review = await dashboardDbQuery(folder, "save_review", message);
         runsProvider.refresh();
         this.reply(message, { command: "reviewSaved", review });
+        return;
+      }
+      if (message.command === "deleteChat") {
+        const chatId = typeof message.chat_id === "string" ? message.chat_id.trim() : "";
+        if (!chatId) {
+          throw new Error("missing chat ID");
+        }
+        const confirmation = await vscode.window.showWarningMessage(
+          "Permanently delete this chat from Agent Quality?",
+          {
+            modal: true,
+            detail: "This removes the chat, its runs, events, reviews, verifier results, and database artifact references. Referenced files are not deleted."
+          },
+          DELETE_CHAT_CONFIRMATION
+        );
+        if (confirmation !== DELETE_CHAT_CONFIRMATION) {
+          this.reply(message, { command: "chatDeletionCancelled", deleted: false });
+          return;
+        }
+        const folder = this.workspaceFolder();
+        const result = await dashboardDbQuery(folder, "delete_chat", { chat_id: chatId });
+        runsProvider.refresh();
+        this.reply(message, { command: "chatDeleted", ...result });
         return;
       }
       if (message.command === "openFile") {
@@ -790,6 +815,114 @@ def backfill_prompt_runs(conn):
     backfill_session_event_run_ids(conn)
 
 
+def delete_where_in(conn, table, column, values):
+    values = list(values)
+    if not values:
+        return
+    placeholders = ", ".join("?" for _ in values)
+    conn.execute(f"DELETE FROM {table} WHERE {column} IN ({placeholders})", values)
+
+
+def select_ids_in(conn, sql_prefix, values):
+    values = list(values)
+    if not values:
+        return []
+    placeholders = ", ".join("?" for _ in values)
+    return conn.execute(sql_prefix + f" ({placeholders})", values).fetchall()
+
+
+def delete_chat(conn, chat_id):
+    session = conn.execute("SELECT id FROM sessions WHERE id=?", [chat_id]).fetchone()
+    if session:
+        chat_type = "session"
+        run_ids = [
+            row["id"]
+            for row in conn.execute("SELECT id FROM runs WHERE session_id=?", [chat_id]).fetchall()
+        ]
+    else:
+        run = conn.execute("SELECT id, session_id FROM runs WHERE id=?", [chat_id]).fetchone()
+        if not run or run["session_id"] not in (None, ""):
+            raise ValueError("unknown chat: " + str(chat_id))
+        chat_type = "standalone_run"
+        run_ids = [run["id"]]
+
+    cluster_ids = set()
+    if run_ids:
+        for row in select_ids_in(
+            conn,
+            "SELECT DISTINCT cluster_id FROM failure_instances WHERE cluster_id IS NOT NULL AND run_id IN",
+            run_ids,
+        ):
+            cluster_ids.add(row["cluster_id"])
+        for row in select_ids_in(
+            conn,
+            "SELECT DISTINCT cluster_id FROM failure_cluster_memberships WHERE run_id IN",
+            run_ids,
+        ):
+            cluster_ids.add(row["cluster_id"])
+
+    artifact_conditions = []
+    artifact_args = []
+    if chat_type == "session":
+        artifact_conditions.append("session_id=?")
+        artifact_args.append(chat_id)
+    if run_ids:
+        artifact_conditions.append("run_id IN (" + ", ".join("?" for _ in run_ids) + ")")
+        artifact_args.extend(run_ids)
+    provider_artifact_ids = []
+    if artifact_conditions:
+        provider_artifact_ids = [
+            row["id"]
+            for row in conn.execute(
+                "SELECT id FROM provider_artifacts WHERE " + " OR ".join(artifact_conditions),
+                artifact_args,
+            ).fetchall()
+        ]
+
+    delete_where_in(conn, "provider_artifact_revisions", "artifact_id", provider_artifact_ids)
+    delete_where_in(conn, "provider_artifacts", "id", provider_artifact_ids)
+    delete_where_in(conn, "failure_cluster_memberships", "run_id", run_ids)
+    delete_where_in(conn, "failure_instances", "run_id", run_ids)
+    delete_where_in(conn, "human_reviews", "run_id", run_ids)
+    delete_where_in(conn, "verifier_results", "run_id", run_ids)
+    delete_where_in(conn, "artifacts", "run_id", run_ids)
+
+    if chat_type == "session":
+        if run_ids:
+            placeholders = ", ".join("?" for _ in run_ids)
+            conn.execute(
+                f"DELETE FROM events WHERE session_id=? OR run_id IN ({placeholders})",
+                [chat_id, *run_ids],
+            )
+        else:
+            conn.execute("DELETE FROM events WHERE session_id=?", [chat_id])
+    else:
+        delete_where_in(conn, "events", "run_id", run_ids)
+
+    delete_where_in(conn, "runs", "id", run_ids)
+    if chat_type == "session":
+        conn.execute("DELETE FROM sessions WHERE id=?", [chat_id])
+
+    for cluster_id in cluster_ids:
+        conn.execute(
+            """
+            UPDATE failure_clusters
+            SET occurrence_count=(
+                SELECT COUNT(*) FROM failure_instances WHERE cluster_id=?
+            )
+            WHERE id=?
+            """,
+            [cluster_id, cluster_id],
+        )
+
+    return {
+        "deleted": True,
+        "chat_id": chat_id,
+        "chat_type": chat_type,
+        "run_count": len(run_ids),
+    }
+
+
 if action == "runs":
     if not os.path.exists(db_path):
         emit([])
@@ -1049,6 +1182,21 @@ elif action == "save_review":
             "notes": payload.get("notes") or "",
             "reviewed_at": reviewed_at,
         })
+elif action == "delete_chat":
+    if not os.path.exists(db_path):
+        raise SystemExit("Agent Quality database does not exist yet.")
+    chat_id = str(payload.get("chat_id") or "").strip()
+    if not chat_id:
+        raise SystemExit("chat_id is required")
+    try:
+        with connect() as conn:
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("BEGIN IMMEDIATE")
+            result = delete_chat(conn, chat_id)
+            conn.commit()
+            emit(result)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
 else:
     raise SystemExit("unknown dashboard action: " + action)
 `;

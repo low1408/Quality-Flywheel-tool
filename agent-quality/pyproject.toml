@@ -7,7 +7,7 @@ name = "agent-quality"
 version = "0.1.0"
 description = "Local-first quality telemetry and verification sidecar for coding agents."
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["PyYAML>=6"]
 
 [project.scripts]
 aq = "agent_quality.cli:main"

@@ -42,6 +42,7 @@
 
   const state = {
     activeTab: "overview",
+    deleting: false,
     details: null,
     pending: new Map(),
     query: "",
@@ -122,6 +123,8 @@
       renderDetail();
     } else if (action === "saveReview") {
       saveReviewNow();
+    } else if (action === "deleteChat") {
+      deleteSelectedChat();
     } else if (action === "closeModal") {
       closeModal();
     }
@@ -349,6 +352,9 @@
     
     const promptText = run.prompt || run.task_summary || "Details";
     const selectedTabId = `run-tab-${state.activeTab}`;
+    const deleteChatButton = vscode && state.viewMode === "chats"
+      ? `<button type="button" class="button danger" data-action="deleteChat"${state.deleting ? " disabled" : ""}>${state.deleting ? "Deleting..." : "Delete Chat"}</button>`
+      : "";
     elements.detailPane.innerHTML = `
       <div class="detail-layout">
         <div class="detail-head">
@@ -363,6 +369,7 @@
             </div>
           </div>
           <div class="detail-actions">
+            ${deleteChatButton}
             <button type="button" class="button ghost" data-action="openDiff">Open Diff</button>
             <button type="button" class="button primary" data-action="setTab" data-tab="review">Review</button>
           </div>
@@ -725,6 +732,40 @@
     showModal("Diff", `aq diff ${runId}`);
   }
 
+  async function deleteSelectedChat() {
+    const chatId = state.selectedRunId;
+    if (!vscode || state.viewMode !== "chats" || !chatId || state.deleting) {
+      return;
+    }
+    const currentIndex = state.runs.findIndex((run) => run.id === chatId);
+    const nextChatId = currentIndex >= 0
+      ? ((state.runs[currentIndex + 1] && state.runs[currentIndex + 1].id) ||
+        (state.runs[currentIndex - 1] && state.runs[currentIndex - 1].id) || null)
+      : null;
+    state.deleting = true;
+    renderDetail();
+    setSync("Deleting");
+    try {
+      const result = await request("deleteChat", { chat_id: chatId });
+      if (!result.deleted) {
+        state.deleting = false;
+        renderDetail();
+        setSync("Idle");
+        return;
+      }
+      state.deleting = false;
+      state.selectedRunId = nextChatId;
+      state.selectedEventId = null;
+      state.details = null;
+      await loadRuns();
+    } catch (error) {
+      state.deleting = false;
+      renderDetail();
+      setSync("Error");
+      showModal("Delete Chat Failed", error.message || String(error));
+    }
+  }
+
   async function request(command, payload) {
     if (vscode) {
       return requestVsCode(command, payload || {});
@@ -761,12 +802,14 @@
     return new Promise((resolve, reject) => {
       state.pending.set(requestId, { resolve, reject });
       vscode.postMessage({ command, requestId, ...(payload || {}) });
-      window.setTimeout(() => {
-        if (state.pending.has(requestId)) {
-          state.pending.delete(requestId);
-          reject(new Error(`${command} timed out`));
-        }
-      }, 30000);
+      if (command !== "deleteChat") {
+        window.setTimeout(() => {
+          if (state.pending.has(requestId)) {
+            state.pending.delete(requestId);
+            reject(new Error(`${command} timed out`));
+          }
+        }, 30000);
+      }
     });
   }
 
