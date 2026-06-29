@@ -499,6 +499,17 @@ class FlywheelPanel {
         this.reply(message, { command: "analysisStarted", started: true });
         return;
       }
+      if (message.command === "copyAnalysisPrompt") {
+        const runIds = Array.isArray(message.run_ids) ? [...new Set(message.run_ids.filter((id) => typeof id === "string" && id))] : [];
+        if (!runIds.length) {
+          throw new Error("Select at least one run.");
+        }
+        const result = await dashboardDbQuery(folder, "flywheel_analysis_prompt", { run_ids: runIds });
+        await vscode.env.clipboard.writeText(result.prompt || "");
+        vscode.window.showInformationMessage(`Copied flywheel analysis prompt for ${result.run_count || 0} run${result.run_count === 1 ? "" : "s"}.`);
+        this.reply(message, { command: "analysisPromptCopied", run_count: result.run_count || 0, character_count: result.character_count || 0 });
+        return;
+      }
       if (message.command === "openRun") {
         if (!message.run_id) {
           throw new Error("missing run ID");
@@ -727,6 +738,88 @@ def event_to_dict(row):
     return data
 
 
+def flywheel_event_dict(row):
+    data = row_to_dict(row)
+    item = {
+        "id": data.get("id"),
+        "event_type": data.get("event_type"),
+        "source_event_type": data.get("source_event_type"),
+        "sequence_number": data.get("sequence_number"),
+        "occurred_at": data.get("occurred_at"),
+        "status": data.get("status"),
+        "item_type": data.get("item_type"),
+        "tool_category": data.get("tool_category"),
+        "command": data.get("command"),
+        "exit_code": data.get("exit_code"),
+        "path": data.get("path"),
+        "duration_ms": data.get("duration_ms"),
+    }
+    for key in ("normalized_payload", "source_payload_sanitized"):
+        raw = data.get(key)
+        if raw:
+            item[key] = compact_value(json_or_value(raw), 4000)
+    return {key: value for key, value in item.items() if value not in (None, "", [])}
+
+
+def flywheel_analysis_prompt(run_items):
+    fence = chr(96) * 3
+    payload = {
+        "runs": run_items,
+        "notes": [
+            "Payloads come from Agent Quality's persisted sanitized event data.",
+            "Large text fields may be truncated."
+        ],
+    }
+    return """You are an expert AI systems debugger.
+
+Analyze the selected Agent Quality runs below. Identify concrete agent failures, likely root causes, and recurring failure clusters across runs.
+
+For each run, infer what a competent coding agent should have done, compare it with the actual behavior, and diagnose any failures.
+
+Return Markdown with these sections:
+1. Executive Summary
+2. Per-Run Diagnoses
+3. Cross-Run Failure Clusters
+4. Recommended Fixes
+5. Regression Test Ideas
+
+Also include this JSON object at the end, inside a fenced JSON code block:
+{
+  "runs": [
+    {
+      "run_id": "string",
+      "overall_score": 0.0,
+      "failures": [
+        {
+          "subcategory": "string",
+          "severity": "low|medium|high|critical",
+          "description": "string",
+          "root_cause": "string",
+          "suggested_fix": "string",
+          "affected_prompt_component": "string|null"
+        }
+      ],
+      "summary": "string"
+    }
+  ],
+  "clusters": [
+    {
+      "title": "string",
+      "affected_run_ids": ["string"],
+      "primary_category": "string",
+      "severity": "low|medium|high|critical",
+      "description": "string",
+      "proposed_intervention": "string"
+    }
+  ]
+}
+
+Selected run data:
+""" + fence + """json
+""" + json.dumps(payload, indent=2, sort_keys=True) + """
+""" + fence
+
+
 def utc_now():
     return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
@@ -930,6 +1023,7 @@ def reasoning_trace(conn, run_id):
             continue
         trace.append({
             "event_id": row["id"],
+            "sequence_number": row["sequence_number"],
             "occurred_at": row["occurred_at"] or row["observed_at"],
             "kind": event_payload.get("reasoning_kind") or "summary",
             "text": compact_text(event_payload["reasoning"]),
@@ -964,6 +1058,7 @@ def tool_calls(conn, run_id):
             call = {
                 "event_id": row["id"],
                 "call_id": call_id,
+                "sequence_number": row["sequence_number"],
                 "occurred_at": row["occurred_at"] or row["observed_at"],
                 "tool_name": tool_name or row["tool_category"] or "tool",
                 "tool_category": tool_category,
@@ -1293,6 +1388,53 @@ elif action == "flywheel_candidates":
             ORDER BY r.started_at DESC, r.id DESC
         """).fetchall()
         emit([run_list_dict(row) for row in rows])
+elif action == "flywheel_analysis_prompt":
+    run_ids = payload.get("run_ids")
+    if not isinstance(run_ids, list):
+        raise SystemExit("run_ids must be a list")
+    run_ids = [str(run_id) for run_id in run_ids if isinstance(run_id, str) and run_id]
+    if not run_ids:
+        raise SystemExit("select at least one run")
+    if not os.path.exists(db_path):
+        raise SystemExit("Agent Quality database does not exist yet")
+    with connect() as conn:
+        run_items = []
+        for run_id in run_ids:
+            run = conn.execute("""
+                SELECT
+                    id,
+                    prompt,
+                    started_at,
+                    completed_at,
+                    agent_adapter,
+                    model,
+                    agent_status,
+                    verifier_status,
+                    human_status,
+                    lifecycle_status
+                FROM runs
+                WHERE id=?
+            """, [run_id]).fetchone()
+            if not run:
+                continue
+            events = conn.execute("""
+                SELECT *
+                FROM events
+                WHERE run_id=?
+                ORDER BY COALESCE(sequence_number, 999999999), occurred_at, observed_at, id
+                LIMIT 120
+            """, [run_id]).fetchall()
+            event_count = conn.execute("SELECT COUNT(*) AS count FROM events WHERE run_id=?", [run_id]).fetchone()["count"]
+            item = run_to_dict(run)
+            item["events"] = [flywheel_event_dict(event) for event in events]
+            item["event_count"] = event_count
+            if event_count > len(events):
+                item["events_truncated"] = event_count - len(events)
+            run_items.append(item)
+        if not run_items:
+            raise SystemExit("none of the selected runs were found")
+        prompt = flywheel_analysis_prompt(run_items)
+        emit({"prompt": prompt, "run_count": len(run_items), "character_count": len(prompt)})
 elif action == "flywheel_analyses":
     if not os.path.exists(db_path):
         emit([])

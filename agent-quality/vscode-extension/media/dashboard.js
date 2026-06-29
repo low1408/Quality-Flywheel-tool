@@ -547,6 +547,73 @@
     return Array.isArray(details[legacyKey]) ? details[legacyKey] : [];
   }
 
+  function buildChronologicalFeed(data) {
+    const feed = [];
+    const appendItems = (items, feedType) => {
+      (items || []).forEach((item) => {
+        feed.push({
+          ...item,
+          feedType,
+          feedIndex: feed.length
+        });
+      });
+    };
+
+    appendItems(data.agent_outputs, "agent_output");
+    appendItems(data.reasoning_trace, "reasoning");
+    appendItems(data.tool_calls, "tool_call");
+
+    return feed.sort(compareFeedItems);
+  }
+
+  function compareFeedItems(a, b) {
+    const timeA = feedTimestamp(a);
+    const timeB = feedTimestamp(b);
+    if (timeA !== timeB) {
+      return timeA - timeB;
+    }
+    const sequenceA = feedSequence(a);
+    const sequenceB = feedSequence(b);
+    if (sequenceA !== sequenceB) {
+      return sequenceA - sequenceB;
+    }
+    const eventA = a.event_id ? String(a.event_id) : "";
+    const eventB = b.event_id ? String(b.event_id) : "";
+    if (eventA && eventB && eventA !== eventB) {
+      return eventA.localeCompare(eventB);
+    }
+    return a.feedIndex - b.feedIndex;
+  }
+
+  function feedTimestamp(item) {
+    const value = Date.parse(item.occurred_at || "");
+    return Number.isFinite(value) ? value : Number.POSITIVE_INFINITY;
+  }
+
+  function feedSequence(item) {
+    const value = Number(item.sequence_number);
+    return Number.isFinite(value) ? value : Number.POSITIVE_INFINITY;
+  }
+
+  function renderExecutionFeed(data, headingId, options = {}) {
+    const feed = buildChronologicalFeed(data);
+    const headingTag = options.headingLevel === "h4" ? "h4" : "h3";
+    const note = options.includeNote === false ? "" : `
+      <p class="section-note">Shows assistant outputs, emitted reasoning summaries, and tool calls in captured chronological order. Private chain-of-thought remains encrypted by Codex and is not available to the collector.</p>
+    `;
+    return `
+      <section class="reading-section" aria-labelledby="${escapeAttr(headingId)}">
+        <${headingTag} id="${escapeAttr(headingId)}" class="section-title">Execution feed</${headingTag}>
+        ${note}
+        ${feed.length ? `
+          <div class="trace-list execution-feed">
+            ${feed.map((item) => renderFeedItem(item)).join("")}
+          </div>
+        ` : '<div class="empty-copy trace-empty">No execution events captured yet.</div>'}
+      </section>
+    `;
+  }
+
   function renderOverview(details) {
     if (details.turns) {
       // Sessions / Chats Overview Mode
@@ -555,10 +622,6 @@
           <div class="overview-primary">
             ${details.turns.map((turn, index) => {
               const run = turn.run;
-              const outputs = turn.agent_outputs || [];
-              const latestOutput = outputs.length ? outputs[outputs.length - 1] : null;
-              const reasoningTrace = turn.reasoning_trace || [];
-              const toolCalls = turn.tool_calls || [];
               return `
                 <div class="chat-turn-card">
                   <div class="chat-turn-header">Turn ${index + 1} (${escapeHtml(run.id)})</div>
@@ -566,23 +629,7 @@
                     <h3 id="prompt-heading-${run.id}" class="section-title">Prompt</h3>
                     <pre class="prompt-block reading-content">${escapeHtml(run.prompt || "No prompt captured.")}</pre>
                   </section>
-                  <section class="reading-section" aria-labelledby="output-heading-${run.id}">
-                    <h3 id="output-heading-${run.id}" class="section-title">Agent output</h3>
-                    ${latestOutput ? outputBlock(latestOutput) : '<div class="empty-copy reading-empty">No agent output captured yet.</div>'}
-                  </section>
-                  <details class="chat-turn-details">
-                    <summary>Reasoning & Tool Calls</summary>
-                    <div style="padding-top: 10px;">
-                      <section class="reading-section" aria-labelledby="reasoning-heading-${run.id}">
-                        <h4 id="reasoning-heading-${run.id}" class="section-subtitle" style="font-size: 12px; margin-bottom: 8px;">Reasoning trace</h4>
-                        ${reasoningTraceBlock(reasoningTrace)}
-                      </section>
-                      <section class="reading-section" aria-labelledby="tools-heading-${run.id}" style="margin-top: 16px;">
-                        <h4 id="tools-heading-${run.id}" class="section-subtitle" style="font-size: 12px; margin-bottom: 8px;">Tool calls</h4>
-                        ${toolCallsBlock(toolCalls)}
-                      </section>
-                    </div>
-                  </details>
+                  ${renderExecutionFeed(turn, `execution-heading-${run.id}`, { includeNote: false })}
                 </div>
               `;
             }).join("")}
@@ -602,10 +649,6 @@
     }
 
     const run = details.run;
-    const outputs = details.agent_outputs || [];
-    const latestOutput = outputs.length ? outputs[outputs.length - 1] : null;
-    const reasoningTrace = details.reasoning_trace || [];
-    const toolCalls = details.tool_calls || [];
     return `
       <div class="overview-stack">
         <div class="overview-primary">
@@ -613,19 +656,7 @@
             <h3 id="prompt-heading" class="section-title">Prompt</h3>
             <pre class="prompt-block reading-content">${escapeHtml(run.prompt || "No prompt captured.")}</pre>
           </section>
-          <section class="reading-section" aria-labelledby="output-heading">
-            <h3 id="output-heading" class="section-title">Agent output</h3>
-            ${latestOutput ? outputBlock(latestOutput) : '<div class="empty-copy reading-empty">No agent output captured yet.</div>'}
-          </section>
-          <section class="reading-section" aria-labelledby="reasoning-heading">
-            <h3 id="reasoning-heading" class="section-title">Reasoning trace</h3>
-            <p class="section-note">Shows emitted commentary and reasoning summaries. Private chain-of-thought remains encrypted by Codex and is not available to the collector.</p>
-            ${reasoningTraceBlock(reasoningTrace)}
-          </section>
-          <section class="reading-section" aria-labelledby="tools-heading">
-            <h3 id="tools-heading" class="section-title">Tool calls</h3>
-            ${toolCallsBlock(toolCalls)}
-          </section>
+          ${renderExecutionFeed(details, "execution-heading")}
         </div>
         <details class="overview-secondary">
           <summary>Run details</summary>
@@ -1023,6 +1054,51 @@
     `;
   }
 
+  function renderFeedItem(item) {
+    if (item.feedType === "agent_output") {
+      return `
+        <article class="trace-entry reasoning-entry execution-feed-item">
+          <div class="trace-head">
+            <span class="trace-kind">Agent output</span>
+            ${item.occurred_at ? `<time>${escapeHtml(formatDate(item.occurred_at))}</time>` : ""}
+          </div>
+          <pre class="trace-content">${escapeHtml(item.text || "")}</pre>
+          ${fileLinksBlock(item.file_links || [])}
+        </article>
+      `;
+    }
+    if (item.feedType === "reasoning") {
+      return `
+        <article class="trace-entry reasoning-entry execution-feed-item">
+          <div class="trace-head">
+            <span class="trace-kind">Reasoning ${escapeHtml(humanize(item.kind || "summary"))}</span>
+            ${item.occurred_at ? `<time>${escapeHtml(formatDate(item.occurred_at))}</time>` : ""}
+          </div>
+          <pre class="trace-content">${escapeHtml(item.text || "")}</pre>
+        </article>
+      `;
+    }
+    if (item.feedType === "tool_call") {
+      return `
+        <details class="trace-entry tool-entry execution-feed-item">
+          <summary>
+            <span class="tool-name">Tool: ${escapeHtml(item.tool_name || "tool")}</span>
+            <span class="status-row">
+              ${item.occurred_at ? `<span class="output-meta">${escapeHtml(formatDate(item.occurred_at))}</span>` : ""}
+              ${item.tool_category ? statusChip(item.tool_category) : ""}
+              ${statusChip(item.status || "observed")}
+            </span>
+          </summary>
+          <div class="tool-detail">
+            ${traceValue("Input", item.input)}
+            ${traceValue("Output", item.output)}
+          </div>
+        </details>
+      `;
+    }
+    return "";
+  }
+
   function reasoningTraceBlock(trace) {
     if (!trace.length) {
       return '<div class="empty-copy trace-empty">No emitted reasoning summaries or commentary captured.</div>';
@@ -1116,45 +1192,43 @@
       lines.push("");
       pushSection(lines, "Prompt", run.prompt || "No prompt captured.", options.textLimit);
 
-      const outputs = turn.agent_outputs || [];
-      if (outputs.length) {
-        outputs.forEach((output, outputIndex) => {
-          const suffix = outputs.length > 1 ? ` ${outputIndex + 1}` : "";
-          pushSection(lines, `Agent output${suffix}`, output.text || "", options.textLimit);
-        });
+      const feed = buildChronologicalFeed(turn);
+      if (feed.length) {
+        lines.push("### Execution feed");
+        lines.push("");
+        feed.forEach((item, feedIndex) => pushTranscriptFeedItem(lines, item, feedIndex, options));
       } else {
-        pushSection(lines, "Agent output", "No agent output captured.", options.textLimit);
-      }
-
-      const trace = turn.reasoning_trace || [];
-      if (trace.length) {
-        lines.push("### Reasoning summaries");
-        lines.push("");
-        trace.forEach((entry, traceIndex) => {
-          lines.push(`#### ${traceIndex + 1}. ${entry.kind || "summary"}${entry.occurred_at ? ` - ${formatDate(entry.occurred_at)}` : ""}`);
-          lines.push("");
-          lines.push(fence(compact(entry.text || "", options.toolLimit)));
-          lines.push("");
-        });
-      }
-
-      const calls = turn.tool_calls || [];
-      if (calls.length) {
-        lines.push("### Tool calls");
-        lines.push("");
-        calls.forEach((call, callIndex) => {
-          lines.push(`#### ${callIndex + 1}. ${call.tool_name || "tool"}`);
-          lines.push("");
-          lines.push(`- Category: ${call.tool_category || "n/a"}`);
-          lines.push(`- Status: ${call.status || "n/a"}`);
-          lines.push(`- Occurred: ${formatDate(call.occurred_at)}`);
-          pushSection(lines, "Input", stringifyForTranscript(call.input), options.toolLimit);
-          pushSection(lines, "Output", stringifyForTranscript(call.output), options.toolLimit);
-        });
+        pushSection(lines, "Execution feed", "No execution events captured.", options.textLimit);
       }
     });
 
     return lines.join("\n").replace(/\n{4,}/g, "\n\n\n").trim() + "\n";
+  }
+
+  function pushTranscriptFeedItem(lines, item, index, options) {
+    if (item.feedType === "agent_output") {
+      lines.push(`#### ${index + 1}. Agent output${item.occurred_at ? ` - ${formatDate(item.occurred_at)}` : ""}`);
+      lines.push("");
+      lines.push(fence(compact(item.text || "", options.textLimit)));
+      lines.push("");
+      return;
+    }
+    if (item.feedType === "reasoning") {
+      lines.push(`#### ${index + 1}. Reasoning ${item.kind || "summary"}${item.occurred_at ? ` - ${formatDate(item.occurred_at)}` : ""}`);
+      lines.push("");
+      lines.push(fence(compact(item.text || "", options.toolLimit)));
+      lines.push("");
+      return;
+    }
+    if (item.feedType === "tool_call") {
+      lines.push(`#### ${index + 1}. Tool call: ${item.tool_name || "tool"}`);
+      lines.push("");
+      lines.push(`- Category: ${item.tool_category || "n/a"}`);
+      lines.push(`- Status: ${item.status || "n/a"}`);
+      lines.push(`- Occurred: ${formatDate(item.occurred_at)}`);
+      pushSection(lines, "Input", stringifyForTranscript(item.input), options.toolLimit);
+      pushSection(lines, "Output", stringifyForTranscript(item.output), options.toolLimit);
+    }
   }
 
   function pushSection(lines, title, content, limit) {

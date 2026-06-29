@@ -21,6 +21,7 @@
     elements.details = document.getElementById("details");
     elements.progress = document.getElementById("progress");
     elements.analyzeButton = document.getElementById("analyzeButton");
+    elements.copyPromptButton = document.getElementById("copyPromptButton");
     document.addEventListener("click", handleClick);
     document.addEventListener("change", handleChange);
     window.addEventListener("message", handleHostMessage);
@@ -63,6 +64,7 @@
     const action = target.dataset.action;
     if (action === "refresh") refresh();
     else if (action === "selectDefaults") selectDefaults();
+    else if (action === "copyPrompt") copyAnalysisPrompt();
     else if (action === "analyze") startAnalysis();
     else if (action === "selectAnalysis") selectAnalysis(target.dataset.analysisId);
     else if (action === "openRun") request("openRun", { run_id: target.dataset.runId }).catch(showError);
@@ -120,6 +122,20 @@
       state.running = false;
       elements.analyzeButton.disabled = false;
       showError(error);
+    }
+  }
+
+  async function copyAnalysisPrompt() {
+    if (state.running) return;
+    elements.copyPromptButton.disabled = true;
+    elements.progress.textContent = "Copying analysis prompt";
+    try {
+      const result = await request("copyAnalysisPrompt", { run_ids: Array.from(state.selectedRuns) });
+      elements.progress.textContent = `Copied prompt for ${result.run_count || 0} run${result.run_count === 1 ? "" : "s"} (${result.character_count || 0} chars)`;
+    } catch (error) {
+      showError(error);
+    } finally {
+      elements.copyPromptButton.disabled = false;
     }
   }
 
