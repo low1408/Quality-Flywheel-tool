@@ -347,7 +347,7 @@ class Tracer:
         self._current_span_stack: list[str] = []
         
         # SQLite Database Ingestion Adapter
-        from core.aq_adapter import AQDbAdapter
+        from .aq_adapter import AQDbAdapter
         self.db_adapter = AQDbAdapter(db_path)
 
     @contextmanager

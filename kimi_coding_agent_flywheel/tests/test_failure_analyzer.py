@@ -167,6 +167,123 @@ class FailureAnalyzerTests(unittest.TestCase):
         self.assertEqual(len(restored.previous_clusters[0].failures), 2)
         self.assertEqual(len(restored.clusterer.clusters), 1)
 
+    def test_cross_domain_same_root_cause_clusters(self) -> None:
+        # Cross-domain same root cause
+        f1 = FailureInstance(
+            failure_id="fail-1",
+            task_id="task-1",
+            agent_name="agent",
+            category="Specification Issues",
+            subcategory="ambiguous_prompt_interpretation",
+            description="The frontend CSS layout ignores mobile responsive constraints.",
+            error_message="",
+            probable_cause="The requirements were underspecified.",
+        )
+        f2 = FailureInstance(
+            failure_id="fail-2",
+            task_id="task-1",
+            agent_name="agent",
+            category="Specification Issues",
+            subcategory="ambiguous_prompt_interpretation",
+            description="The backend database API endpoint omits pagination parameters.",
+            error_message="",
+            probable_cause="The prompt was vague.",
+        )
+        # Even with CSS/API disjoint terms, they should cluster together because they share the same normalized root cause prompt_underspecification
+        clusterer = FailureClusteringEngine(min_cluster_size=2, eps=0.5)
+        clusters = clusterer.cluster([f1, f2])
+        self.assertEqual(len(clusters), 1)
+        self.assertIn("Prompt Underspecification", clusters[0].label)
+
+    def test_same_domain_different_root_causes_do_not_cluster(self) -> None:
+        # Same domain (CSS) but different root causes
+        f1 = FailureInstance(
+            failure_id="fail-1",
+            task_id="task-1",
+            agent_name="agent",
+            category="Specification Issues",
+            subcategory="ambiguous_prompt_interpretation",
+            description="CSS rules for buttons were not specified.",
+            probable_cause="The requirements were vague.",
+        )
+        f2 = FailureInstance(
+            failure_id="fail-2",
+            task_id="task-1",
+            agent_name="agent",
+            category="Code Quality",
+            subcategory="code_syntax_error",
+            description="CSS parsing error in button rules.",
+            probable_cause="Syntax error due to typo.",
+        )
+        # They should NOT cluster together because of different root causes
+        clusterer = FailureClusteringEngine(min_cluster_size=2, eps=0.3)
+        clusters = clusterer.cluster([f1, f2])
+        self.assertEqual(len(clusters), 0)
+
+    def test_task_id_and_framework_terms_do_not_affect_partition(self) -> None:
+        # Changing task_id and framework terms should not affect clustering when root causes are identical
+        f1 = FailureInstance(
+            failure_id="fail-1",
+            task_id="task-1",
+            agent_name="agent",
+            category="Specification Issues",
+            subcategory="ambiguous_prompt_interpretation",
+            description="React layout ignores constraints.",
+            probable_cause="vague prompt",
+        )
+        f2 = FailureInstance(
+            failure_id="fail-2",
+            task_id="task-2", # different task
+            agent_name="agent",
+            category="Specification Issues",
+            subcategory="ambiguous_prompt_interpretation",
+            description="Django view omits route parameters.",
+            probable_cause="vague prompt",
+        )
+        clusterer = FailureClusteringEngine(min_cluster_size=2, eps=0.5)
+        clusters = clusterer.cluster([f1, f2])
+        self.assertEqual(len(clusters), 1)
+
+    def test_embedding_failure_is_explicit(self) -> None:
+        def raising_embedding(texts: list[str]) -> list[list[float]]:
+            raise ValueError("model offline")
+            
+        clusterer = FailureClusteringEngine(embedding_fn=raising_embedding, min_cluster_size=2, eps=0.3)
+        f1 = FailureInstance(failure_id="f1", task_id="t1", agent_name="agent", probable_cause="cause")
+        f2 = FailureInstance(failure_id="f2", task_id="t2", agent_name="agent", probable_cause="cause")
+        
+        with self.assertRaises(RuntimeError) as ctx:
+            clusterer.cluster([f1, f2])
+        self.assertIn("Clustering feature extraction failed", str(ctx.exception))
+
+    def test_membership_confidence_is_calculated_from_centroid(self) -> None:
+        f1 = FailureInstance(
+            failure_id="fail-1",
+            task_id="task-1",
+            agent_name="agent",
+            category="Specification Issues",
+            subcategory="ambiguous_prompt_interpretation",
+            probable_cause="vague prompt",
+        )
+        f2 = FailureInstance(
+            failure_id="fail-2",
+            task_id="task-1",
+            agent_name="agent",
+            category="Specification Issues",
+            subcategory="ambiguous_prompt_interpretation",
+            probable_cause="vague prompt",
+        )
+        
+        def custom_embedding(texts: list[str]) -> list[list[float]]:
+            return [[1.0, 0.0], [0.0, 1.0]]
+            
+        clusterer = FailureClusteringEngine(embedding_fn=custom_embedding, min_cluster_size=2, eps=1.01)
+        clusters = clusterer.cluster([f1, f2])
+        
+        self.assertEqual(len(clusters), 1)
+        self.assertAlmostEqual(f1.cluster_confidence, 0.70710678)
+        self.assertAlmostEqual(f2.cluster_confidence, 0.70710678)
+
 
 if __name__ == "__main__":
     unittest.main()

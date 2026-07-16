@@ -17,6 +17,9 @@ from agent_quality.review.service import save_review_api
 
 MAX_CONTENT_LENGTH = 1_000_000
 MAX_FILE_PREVIEW_BYTES = 1_000_000
+DASHBOARD_TEXT_LIMIT = 12000
+DASHBOARD_OUTPUT_LIMIT = 60000
+DASHBOARD_LIST_LIMIT = 200
 
 STATIC_ASSETS = {
     "/v1/ui/dashboard.css": "dashboard.css",
@@ -134,7 +137,7 @@ class CollectorHandler(BaseHTTPRequestHandler):
         with connect(self.server.db_path) as conn:
             _backfill_prompt_runs(conn)
             rows = all_rows(conn, "SELECT * FROM runs ORDER BY started_at DESC, id DESC")
-        self._send_json([_row_to_dict(row) for row in rows])
+        self._send_json([_run_list_dict(row) for row in rows])
 
     def _handle_ui_sessions(self) -> None:
         with connect(self.server.db_path) as conn:
@@ -164,7 +167,7 @@ class CollectorHandler(BaseHTTPRequestHandler):
                 r.started_at AS started_at,
                 r.completed_at AS ended_at,
                 r.verifier_status AS final_outcome,
-                r.prompt AS task_summary,
+                substr(COALESCE(r.prompt, ''), 1, 240) AS task_summary,
                 0 AS is_session,
                 1 AS turn_count,
                 r.model AS model,
@@ -188,7 +191,7 @@ class CollectorHandler(BaseHTTPRequestHandler):
                 self._send_json_error(404, "unknown run")
                 return
             payload = {
-                "run": _row_to_dict(run),
+                "run": _run_to_dict(run),
                 "artifacts": [
                     _row_to_dict(row)
                     for row in all_rows(
@@ -258,9 +261,6 @@ class CollectorHandler(BaseHTTPRequestHandler):
                 runs = [run_row]
             
             turns_details = []
-            all_artifacts = []
-            all_verifier_results = []
-            all_events = []
             
             for run in runs:
                 r_id = run["id"]
@@ -310,7 +310,7 @@ class CollectorHandler(BaseHTTPRequestHandler):
                 ]
                 
                 turns_details.append({
-                    "run": _row_to_dict(run),
+                    "run": _run_to_dict(run),
                     "artifacts": artifacts,
                     "verifier_results": verifier_results,
                     "events": events,
@@ -320,16 +320,9 @@ class CollectorHandler(BaseHTTPRequestHandler):
                     "human_reviews": human_reviews
                 })
                 
-                all_artifacts.extend(artifacts)
-                all_verifier_results.extend(verifier_results)
-                all_events.extend(events)
-            
             payload = {
                 "session": session_dict,
-                "turns": turns_details,
-                "all_artifacts": all_artifacts,
-                "all_verifier_results": all_verifier_results,
-                "all_events": all_events
+                "turns": turns_details
             }
         self._send_json(payload)
 
@@ -433,11 +426,48 @@ def _row_to_dict(row: sqlite3.Row) -> dict:
     return {key: row[key] for key in row.keys()}
 
 
+def _compact_text(value: object, limit: int = DASHBOARD_TEXT_LIMIT) -> str:
+    text = str(value)
+    if len(text) <= limit:
+        return text
+    omitted = len(text) - limit
+    return f"{text[:limit]}\n\n[truncated: {omitted} chars omitted]"
+
+
+def _compact_value(value: object, text_limit: int = DASHBOARD_TEXT_LIMIT) -> object:
+    if isinstance(value, str):
+        return _compact_text(value, text_limit)
+    if isinstance(value, list):
+        items = [_compact_value(item, text_limit) for item in value[:DASHBOARD_LIST_LIMIT]]
+        if len(value) > DASHBOARD_LIST_LIMIT:
+            items.append({"_truncated_items": len(value) - DASHBOARD_LIST_LIMIT})
+        return items
+    if isinstance(value, dict):
+        return {str(key): _compact_value(item, text_limit) for key, item in value.items()}
+    return value
+
+
+def _run_to_dict(row: sqlite3.Row) -> dict:
+    data = _row_to_dict(row)
+    if data.get("prompt"):
+        data["prompt"] = _compact_text(data["prompt"], DASHBOARD_OUTPUT_LIMIT)
+    return data
+
+
+def _run_list_dict(row: sqlite3.Row) -> dict:
+    data = _row_to_dict(row)
+    if data.get("prompt"):
+        data["prompt"] = _compact_text(data["prompt"], 240)
+    return data
+
+
 def _event_to_dict(row: sqlite3.Row) -> dict:
     data = _row_to_dict(row)
     for key in ("normalized_payload", "source_payload_sanitized", "provider_extensions", "redaction_findings"):
-        if data.get(key):
-            data[f"{key}_json"] = _json_or_value(data[key])
+        raw = data.get(key)
+        if raw:
+            data[f"{key}_json"] = _compact_value(_json_or_value(raw))
+            data[key] = _compact_text(raw, 2000)
     return data
 
 
@@ -634,7 +664,7 @@ def _agent_outputs(conn: sqlite3.Connection, run_id: str) -> list[dict[str, obje
                 "event_id": row["id"],
                 "sequence_number": row["sequence_number"],
                 "occurred_at": row["occurred_at"] or row["observed_at"],
-                "text": str(text),
+                "text": _compact_text(text, DASHBOARD_OUTPUT_LIMIT),
                 "file_links": file_links,
             }
         )
@@ -654,9 +684,10 @@ def _reasoning_trace(conn: sqlite3.Connection, run_id: str) -> list[dict[str, ob
         trace.append(
             {
                 "event_id": row["id"],
+                "sequence_number": row["sequence_number"],
                 "occurred_at": row["occurred_at"] or row["observed_at"],
                 "kind": payload.get("reasoning_kind") or "summary",
-                "text": str(payload["reasoning"]),
+                "text": _compact_text(payload["reasoning"]),
             }
         )
     return trace
@@ -690,22 +721,25 @@ def _tool_calls(conn: sqlite3.Connection, run_id: str) -> list[dict[str, object]
             call = {
                 "event_id": row["id"],
                 "call_id": call_id,
+                "sequence_number": row["sequence_number"],
                 "occurred_at": row["occurred_at"] or row["observed_at"],
                 "tool_name": tool_name or row["tool_category"] or "tool",
                 "tool_category": tool_category,
                 "status": row["status"],
-                "input": payload.get("tool_input", hook.get("tool_input", hook.get("toolInput"))),
+                "input": _compact_value(payload.get("tool_input", hook.get("tool_input", hook.get("toolInput")))),
                 "output": None,
             }
             by_id[key] = call
             calls.append(call)
         elif call.get("input") is None:
-            call["input"] = payload.get("tool_input", hook.get("tool_input", hook.get("toolInput")))
+            call["input"] = _compact_value(payload.get("tool_input", hook.get("tool_input", hook.get("toolInput"))))
         if is_completed:
             call["status"] = row["status"] or "completed"
-            call["output"] = payload.get(
-                "tool_output",
-                hook.get("tool_response", hook.get("toolResponse")),
+            call["output"] = _compact_value(
+                payload.get(
+                    "tool_output",
+                    hook.get("tool_response", hook.get("toolResponse")),
+                )
             )
     return calls
 

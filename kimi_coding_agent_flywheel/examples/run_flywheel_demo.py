@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from core.benchmark import (
+from ..core.benchmark import (
     BenchmarkSuite,
     BenchmarkTask,
     Difficulty,
@@ -24,8 +24,8 @@ from core.benchmark import (
     TaskType,
     TestCase,
 )
-from core.flywheel import FlywheelConfig, QualityFlywheel
-from examples.example_agent_wrappers import MockCodingAgent
+from ..core.flywheel import FlywheelConfig, QualityFlywheel
+from .example_agent_wrappers import MockCodingAgent
 
 
 def create_demo_benchmark_suite() -> BenchmarkSuite:

@@ -59,3 +59,5 @@ code vscode-extension
 ```
 
 Install the Python package first so `aq` is on `PATH`, then launch the extension host from VS Code. The extension adds an Agent Quality activity view and command palette actions for initializing a project, running a measured prompt or selection, installing Codex hooks, starting the collector, and opening run details.
+
+When this checkout sits beside `kimi_coding_agent_flywheel`, the initializer also installs the separate `aq-flywheel` analysis worker. Configure `agentQuality.flywheelJudgeCommand` in VS Code as an argument array for a local command that reads a redacted diagnosis prompt from stdin and writes the required diagnosis JSON to stdout. Then run **Agent Quality: Open Flywheel** to select completed runs, launch diagnosis and clustering, and inspect immutable analysis history. The flywheel panel does not run prompt optimization or regression execution.

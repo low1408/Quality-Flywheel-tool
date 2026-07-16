@@ -21,9 +21,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from core.benchmark import BenchmarkSuite, CodingAgent, EvaluationResult
-from core.telemetry import TraceAnalyzer
-from clustering.failure_analyzer import (
+from .benchmark import BenchmarkSuite, CodingAgent, EvaluationResult
+from .telemetry import TraceAnalyzer
+from ..clustering.failure_analyzer import (
     FailureAnalysisPipeline,
     FailureCluster,
     FailureInstance,
@@ -31,15 +31,15 @@ from clustering.failure_analyzer import (
     FailureClusteringEngine,
     RootCauseAnalyzer,
 )
-from optimization.prompt_optimizer import (
+from ..optimization.prompt_optimizer import (
     BenchmarkPromptEvaluator,
     CompositePromptOptimizer,
     ErrorDrivenOptimizer,
     GeneticPromptOptimizer,
     PromptCandidate,
 )
-from regression.regression_suite import QualityGate, RegressionReport, RegressionSuite
-from monitoring.dashboard import ConsoleDashboard, ProductionMonitor, UserFeedbackCollector
+from ..regression.regression_suite import QualityGate, RegressionReport, RegressionSuite
+from ..monitoring.dashboard import ConsoleDashboard, ProductionMonitor, UserFeedbackCollector
 
 
 def utc_now() -> datetime:
@@ -168,7 +168,7 @@ class QualityFlywheel:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
         # SQLite Database Ingestion Adapter
-        from core.aq_adapter import AQDbAdapter
+        from .aq_adapter import AQDbAdapter
         self.db_adapter = AQDbAdapter()
 
     async def initialize(self) -> None:
@@ -523,7 +523,7 @@ class QualityFlywheel:
         if not self.production_monitor:
             return {"error": "Production monitoring not enabled"}
 
-        from monitoring.dashboard import ProductionTrace
+        from ..monitoring.dashboard import ProductionTrace
 
         # Convert to production traces
         production_traces = []

@@ -13,8 +13,8 @@ from agent_quality.capture.artifacts import write_artifact
 from agent_quality.timeutil import utc_now
 
 if TYPE_CHECKING:
-    from core.telemetry import Trace, TraceEvent
-    from clustering.failure_analyzer import FailureCluster
+    from .telemetry import Trace, TraceEvent
+    from ..clustering.failure_analyzer import FailureCluster
 
 
 class AQDbAdapter:
@@ -290,9 +290,161 @@ class AQDbAdapter:
                 },
             )
 
+    def load_run_traces(self, run_ids: list[str]) -> list[dict[str, Any]]:
+        """Load exact Agent Quality runs as canonical, redacted trace dictionaries."""
+        if not run_ids:
+            return []
+        unique_ids = list(dict.fromkeys(str(run_id) for run_id in run_ids))
+        placeholders = ",".join("?" for _ in unique_ids)
+        conn = self.connect()
+        rows = aq_db.all_rows(conn, f"SELECT * FROM runs WHERE id IN ({placeholders})", unique_ids)
+        by_id = {row["id"]: row for row in rows}
+        missing = [run_id for run_id in unique_ids if run_id not in by_id]
+        if missing:
+            raise ValueError(f"unknown run IDs: {', '.join(missing)}")
+
+        traces: list[dict[str, Any]] = []
+        for run_id in unique_ids:
+            run = by_id[run_id]
+            events = aq_db.all_rows(
+                conn,
+                "SELECT * FROM events WHERE run_id=? ORDER BY COALESCE(sequence_number, rowid), rowid",
+                [run_id],
+            )
+            prompt_artifact = aq_db.one(
+                conn,
+                "SELECT path FROM artifacts WHERE run_id=? AND artifact_type='prompt' ORDER BY rowid DESC LIMIT 1",
+                [run_id],
+            )
+            system_prompt = None
+            if prompt_artifact:
+                artifact_path = Path(prompt_artifact["path"])
+                if artifact_path.is_file():
+                    system_prompt = artifact_path.read_text(encoding="utf-8", errors="replace")
+            traces.append(
+                {
+                    "trace_id": run_id,
+                    "task_id": run_id,
+                    "task_description": run["prompt"] or "",
+                    "agent_name": run["agent_adapter"],
+                    "model_id": run["model"],
+                    "system_prompt": system_prompt,
+                    "start_time": run["started_at"],
+                    "end_time": run["completed_at"],
+                    "events": [self._canonical_event(row) for row in events],
+                }
+            )
+        conn.close()
+        return traces
+
+    def _canonical_event(self, row: sqlite3.Row) -> dict[str, Any]:
+        normalized = self._json_object(row["normalized_payload"])
+        source = self._json_object(row["source_payload_sanitized"])
+        extensions = self._json_object(row["provider_extensions"])
+        hook = self._nested_hook(source) or self._extension_hook(extensions)
+        source_type = str(row["source_event_type"] or "")
+        event_type = self._canonical_event_type(row, source_type)
+        content = self._first_text(
+            normalized.get("content"),
+            normalized.get("assistant_output"),
+            normalized.get("reasoning"),
+            normalized.get("output"),
+            source.get("content"),
+            source.get("text"),
+            source.get("message"),
+            source.get("output"),
+            hook.get("last_assistant_message"),
+            hook.get("assistant_message"),
+            hook.get("response"),
+            hook.get("prompt") if source_type == "UserPromptSubmit" else None,
+        )
+        tool_error = self._first_text(
+            source.get("tool_error"),
+            normalized.get("tool_error"),
+            normalized.get("error"),
+            hook.get("tool_error"),
+            hook.get("error"),
+        )
+        if not tool_error and (row["status"] == "failed" or (row["exit_code"] not in (None, 0))):
+            tool_error = content or f"{source_type or 'event'} failed"
+        return {
+            "event_id": row["id"],
+            "event_type": event_type,
+            "timestamp": row["occurred_at"] or row["observed_at"],
+            "step_number": row["sequence_number"] or 0,
+            "content": content,
+            "metadata": {},
+            "model": normalized.get("model") or source.get("model") or hook.get("model"),
+            "tokens_in": normalized.get("tokens_in") or source.get("tokens_in") or 0,
+            "tokens_out": normalized.get("tokens_out") or source.get("tokens_out") or 0,
+            "latency_ms": normalized.get("latency_ms") or row["duration_ms"] or 0,
+            "tool_name": row["command"] or normalized.get("tool_name") or normalized.get("tool") or source.get("tool_name") or hook.get("tool_name"),
+            "tool_input": normalized.get("tool_input") or extensions.get("tool_input") or source.get("tool_input") or hook.get("tool_input") or hook.get("arguments"),
+            "tool_output": normalized.get("tool_output") or extensions.get("tool_output") or source.get("tool_output") or hook.get("tool_output"),
+            "tool_error": tool_error or None,
+            "decision_options": extensions.get("decision_options"),
+            "decision_choice": extensions.get("decision_choice"),
+            "decision_reasoning": extensions.get("decision_reasoning"),
+            "parent_event_id": row["parent_event_id"],
+        }
+
+    @staticmethod
+    def _json_object(value: Any) -> dict[str, Any]:
+        if isinstance(value, dict):
+            return value
+        if not value:
+            return {}
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except (TypeError, json.JSONDecodeError):
+            return {}
+
+    @staticmethod
+    def _nested_hook(source: dict[str, Any]) -> dict[str, Any]:
+        extensions = source.get("extensions")
+        if not isinstance(extensions, dict):
+            return {}
+        hook = extensions.get("openai.codex.hook")
+        return hook if isinstance(hook, dict) else {}
+
+    @staticmethod
+    def _extension_hook(extensions: dict[str, Any]) -> dict[str, Any]:
+        hook = extensions.get("openai.codex.hook")
+        return hook if isinstance(hook, dict) else {}
+
+    @staticmethod
+    def _first_text(*values: Any) -> str:
+        for value in values:
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+            if isinstance(value, (dict, list)):
+                return json.dumps(value, sort_keys=True)
+        return ""
+
+    @staticmethod
+    def _canonical_event_type(row: sqlite3.Row, source_type: str) -> str:
+        known = {
+            "LLM_REQUEST", "LLM_RESPONSE", "TOOL_CALL", "TOOL_RESULT", "THOUGHT",
+            "ACTION", "OBSERVATION", "DECISION", "STATE_CHANGE", "ERROR", "COMPLETION", "METRIC",
+        }
+        upper = source_type.upper()
+        if upper in known:
+            return upper
+        event_name = str(row["event_type"] or "").lower()
+        if row["status"] == "failed" or (row["exit_code"] not in (None, 0)) or "error" in event_name:
+            return "ERROR"
+        if row["command"] or row["tool_category"] or "tool" in event_name:
+            return "TOOL_RESULT" if any(token in event_name for token in ("completed", "result", "after")) else "TOOL_CALL"
+        if row["item_type"] == "assistant_output" or any(token in event_name for token in ("message", "response")):
+            return "LLM_RESPONSE"
+        if any(token in event_name for token in ("stop", "complete")):
+            return "COMPLETION"
+        return "OBSERVATION"
+
     def load_session_traces(self, session_id: str | list[str]) -> list[Trace]:
         """Reconstruct Kimi Trace objects from authoritative SQLite storage."""
-        from core.telemetry import Trace, TraceEvent, EventType
+        from .telemetry import Trace, TraceEvent, EventType
         
         session_ids = [session_id] if isinstance(session_id, str) else session_id
         if not session_ids:
@@ -393,15 +545,24 @@ class AQDbAdapter:
         judge_version: str | None = None,
         redaction_version: str | None = None,
         status: str = "completed",
+        selected_run_count: int = 0,
     ) -> None:
         """Insert or update a versioned failure analysis run log."""
         conn = self.connect()
         with conn:
             conn.execute(
                 """
-                INSERT OR REPLACE INTO analysis_runs (
-                    id, algorithm, parameters, judge_version, redaction_version, created_at, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO analysis_runs (
+                    id, algorithm, parameters, judge_version, redaction_version, created_at,
+                    status, selected_run_count
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    algorithm=excluded.algorithm,
+                    parameters=excluded.parameters,
+                    judge_version=excluded.judge_version,
+                    redaction_version=excluded.redaction_version,
+                    status=excluded.status,
+                    selected_run_count=excluded.selected_run_count
                 """,
                 (
                     analysis_id,
@@ -411,19 +572,121 @@ class AQDbAdapter:
                     redaction_version,
                     utc_now(),
                     status,
+                    selected_run_count,
                 ),
             )
 
-    def save_failure_instance(self, conn: sqlite3.Connection, failure: FailureCluster | Any, cluster_id: str | None = None) -> None:
+    def create_analysis_run(
+        self,
+        analysis_id: str,
+        run_ids: list[str],
+        *,
+        parameters: dict[str, Any],
+        judge_version: str,
+    ) -> None:
+        full_params = {
+            "clustering_strategy": "root_cause_tfidf_v1",
+            "feature_schema": "failure_features_v1",
+            "algorithm": "dbscan",
+            "metric": "cosine",
+            "eps": 0.3,
+            **parameters
+        }
+        self.save_analysis_run(
+            analysis_id,
+            "DBSCAN",
+            parameters=json.dumps(full_params, sort_keys=True),
+            judge_version=judge_version,
+            redaction_version=aq_redact.POLICY_VERSION,
+            status="running",
+            selected_run_count=len(run_ids),
+        )
+        conn = self.connect()
+        with conn:
+            for run_id in run_ids:
+                aq_db.insert(
+                    conn,
+                    "analysis_inputs",
+                    {
+                        "analysis_id": analysis_id,
+                        "run_id": run_id,
+                        "status": "pending",
+                        "failure_count": 0,
+                        "error_type": None,
+                        "error_message": None,
+                    },
+                    or_action="OR REPLACE",
+                )
+
+    def update_analysis_input(
+        self,
+        analysis_id: str,
+        run_id: str,
+        *,
+        status: str,
+        failure_count: int = 0,
+        error_type: str | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        conn = self.connect()
+        with conn:
+            conn.execute(
+                """
+                UPDATE analysis_inputs
+                SET status=?, failure_count=?, error_type=?, error_message=?
+                WHERE analysis_id=? AND run_id=?
+                """,
+                [status, failure_count, error_type, self._redact_text(error_message), analysis_id, run_id],
+            )
+
+    def finish_analysis_run(
+        self,
+        analysis_id: str,
+        *,
+        status: str,
+        algorithm: str | None = None,
+        failure_count: int = 0,
+        cluster_count: int = 0,
+        error_message: str | None = None,
+    ) -> None:
+        conn = self.connect()
+        with conn:
+            if algorithm:
+                conn.execute(
+                    """
+                    UPDATE analysis_runs
+                    SET status=?, completed_at=?, error_message=?, failure_count=?, cluster_count=?, algorithm=?
+                    WHERE id=?
+                    """,
+                    [status, utc_now(), self._redact_text(error_message), failure_count, cluster_count, algorithm, analysis_id],
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE analysis_runs
+                    SET status=?, completed_at=?, error_message=?, failure_count=?, cluster_count=?
+                    WHERE id=?
+                    """,
+                    [status, utc_now(), self._redact_text(error_message), failure_count, cluster_count, analysis_id],
+                )
+
+    def save_failure_instance(
+        self,
+        conn: sqlite3.Connection,
+        failure: Any,
+        cluster_id: str | None = None,
+        analysis_id: str | None = None,
+    ) -> None:
         """Save a FailureInstance to the failure_instances SQLite table."""
         # Map timestamp to ISO format string safely
         ts_val = failure.timestamp.isoformat() if isinstance(failure.timestamp, datetime) else str(failure.timestamp)
-        
+
         aq_db.insert(
             conn,
             "failure_instances",
             {
-                "id": failure.failure_id,
+                "id": f"{analysis_id}:{failure.failure_id}" if analysis_id else failure.failure_id,
+                "analysis_id": analysis_id,
                 "run_id": failure.task_id,
                 "cluster_id": cluster_id,
                 "category": failure.category,
@@ -439,96 +702,123 @@ class AQDbAdapter:
             or_action="OR REPLACE",
         )
 
-    def save_failures(self, failures: list[Any]) -> None:
+    def save_failures(self, failures: list[Any], analysis_id: str | None = None) -> None:
         """Save a list of FailureInstance objects to SQLite."""
         conn = self.connect()
         with conn:
             for failure in failures:
-                self.save_failure_instance(conn, failure, None)
+                self.save_failure_instance(conn, failure, None, analysis_id)
+
+    def persist_analysis_results(self, analysis_id: str, failures: list[Any], clusters: list[FailureCluster]) -> None:
+        """Atomically persist all diagnosed failures, clusters, and memberships."""
+        conn = self.connect()
+        with conn:
+            for failure in failures:
+                self.save_failure_instance(conn, failure, None, analysis_id)
+            self._save_clusters(conn, analysis_id, clusters)
 
     def save_clusters(self, analysis_id: str, clusters: list[FailureCluster]) -> None:
         """Persist FailureCluster definitions and map runs to cluster memberships in SQLite."""
         conn = self.connect()
         with conn:
-            for cluster in clusters:
-                cluster_id = f"cluster_{cluster.cluster_id}_{analysis_id}"
-                
-                # Check if cluster already exists
-                existing = aq_db.one(conn, "SELECT id FROM failure_clusters WHERE id=?", [cluster_id])
-                
-                # Map extra cluster metadata into provider_extensions JSON column
-                extra_payload = json.dumps({
+            self._save_clusters(conn, analysis_id, clusters)
+
+    def _save_clusters(self, conn: sqlite3.Connection, analysis_id: str, clusters: list[FailureCluster]) -> None:
+        for cluster in clusters:
+            # Stable cluster ID signature from dominant category, dominant subcategory, and affected prompt component
+            sig_parts = [
+                cluster.dominant_category or "unknown",
+                cluster.dominant_subcategory or "unknown",
+                cluster.failures[0].affected_prompt_component or "unknown" if cluster.failures else "unknown"
+            ]
+            sig = ":".join(sig_parts)
+            import hashlib
+            sig_hash = hashlib.sha256(sig.encode('utf-8')).hexdigest()[:12]
+            cluster_id = f"cluster_{sig_hash}"
+
+            existing = aq_db.one(conn, "SELECT id FROM failure_clusters WHERE id=?", [cluster_id])
+            extra_payload = json.dumps(
+                {
                     "dominant_subcategory": cluster.dominant_subcategory,
                     "common_keywords": cluster.common_keywords,
                     "common_tool_calls": cluster.common_tool_calls,
                     "regression_tests_needed": cluster.regression_tests_needed,
-                })
+                }
+            )
 
-                if not existing:
-                    aq_db.insert(
-                        conn,
-                        "failure_clusters",
-                        {
-                            "id": cluster_id,
-                            "title": cluster.label,
-                            "description": cluster.description,
-                            "primary_category": cluster.dominant_category,
-                            "severity": cluster.avg_severity,
-                            "status": "active",
-                            "first_seen_at": utc_now(),
-                            "last_seen_at": utc_now(),
-                            "occurrence_count": len(cluster.failures),
-                            "proposed_intervention": cluster.suggested_prompt_fix or cluster.suggested_tool_fix,
-                            "linked_regression_case": None,
-                            "provider_extensions": extra_payload,
-                        },
-                    )
-                else:
-                    conn.execute(
-                        """
-                        UPDATE failure_clusters SET
-                            title=?, description=?, primary_category=?, severity=?,
-                            occurrence_count=?, proposed_intervention=?, provider_extensions=?, last_seen_at=?
-                        WHERE id=?
-                        """,
-                        (
-                            cluster.label,
-                            cluster.description,
-                            cluster.dominant_category,
-                            cluster.avg_severity,
-                            len(cluster.failures),
-                            cluster.suggested_prompt_fix or cluster.suggested_tool_fix,
-                            extra_payload,
-                            utc_now(),
-                            cluster_id,
-                        ),
-                    )
+            if not existing:
+                aq_db.insert(
+                    conn,
+                    "failure_clusters",
+                    {
+                        "id": cluster_id,
+                        "title": cluster.label,
+                        "description": cluster.description,
+                        "primary_category": cluster.dominant_category,
+                        "severity": cluster.avg_severity,
+                        "status": "active",
+                        "first_seen_at": utc_now(),
+                        "last_seen_at": utc_now(),
+                        "occurrence_count": len(cluster.failures),
+                        "proposed_intervention": cluster.suggested_prompt_fix or cluster.suggested_tool_fix,
+                        "linked_regression_case": None,
+                        "provider_extensions": extra_payload,
+                    },
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE failure_clusters SET
+                        title=?, description=?, primary_category=?, severity=?,
+                        proposed_intervention=?, provider_extensions=?, last_seen_at=?
+                    WHERE id=?
+                    """,
+                    (
+                        cluster.label,
+                        cluster.description,
+                        cluster.dominant_category,
+                        cluster.avg_severity,
+                        cluster.suggested_prompt_fix or cluster.suggested_tool_fix,
+                        extra_payload,
+                        utc_now(),
+                        cluster_id,
+                    ),
+                )
 
-                # Persist memberships and failure instances
-                for failure in cluster.failures:
-                    # Save failure instance
-                    self.save_failure_instance(conn, failure, cluster_id)
-                    
-                    # Save membership
-                    aq_db.insert(
-                        conn,
-                        "failure_cluster_memberships",
-                        {
-                            "analysis_id": analysis_id,
-                            "run_id": failure.task_id, # Kimi's FailureInstance task_id matches run_id in agent-quality
-                            "cluster_id": cluster_id,
-                            "assignment_type": "dbscan",
-                            "confidence": float(failure.llm_judge_score or 1.0) / 10.0,
-                        },
-                        or_action="OR REPLACE",
-                    )
+            for failure in cluster.failures:
+                self.save_failure_instance(conn, failure, cluster_id, analysis_id)
+                confidence = getattr(failure, "cluster_confidence", None)
+                if confidence is None:
+                    confidence = float(failure.llm_judge_score or 10.0) / 10.0
+                aq_db.insert(
+                    conn,
+                    "failure_cluster_memberships",
+                    {
+                        "analysis_id": analysis_id,
+                        "run_id": failure.task_id,
+                        "cluster_id": cluster_id,
+                        "assignment_type": getattr(cluster, "assignment_type", "dbscan"),
+                        "confidence": confidence,
+                    },
+                    or_action="OR REPLACE",
+                )
+
+            # Update count in a self-healing way
+            conn.execute(
+                """
+                UPDATE failure_clusters
+                SET occurrence_count=(SELECT COUNT(*) FROM failure_instances WHERE cluster_id=?)
+                WHERE id=?
+                """,
+                [cluster_id, cluster_id]
+            )
 
     def import_legacy_traces(self, directory: str | Path) -> int:
         """
         Scan a directory of legacy JSON traces, load them, and import them into SQLite
         with full sanitization/redaction. Returns the number of successfully imported traces.
         """
-        from core.telemetry import Trace
+        from .telemetry import Trace
         
         dir_path = Path(directory)
         if not dir_path.exists():
@@ -581,4 +871,3 @@ class AQDbAdapter:
                 print(f"Warning: Failed to import legacy trace {trace_file}: {e}", file=sys.stderr)
                 
         return imported_count
-

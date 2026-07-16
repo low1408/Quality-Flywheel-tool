@@ -37,6 +37,44 @@ def test_migration_adds_column(tmp_path):
     columns = [row[1] for row in cursor.fetchall()]
     assert "provider_extensions" not in columns
     conn.close()
+
+
+def test_migration_adds_analysis_history_without_losing_existing_row(tmp_path):
+    db_path = tmp_path / "old_analysis.sqlite3"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE analysis_runs (
+            id TEXT PRIMARY KEY,
+            algorithm TEXT NOT NULL,
+            parameters TEXT,
+            judge_version TEXT,
+            redaction_version TEXT,
+            created_at TEXT NOT NULL,
+            status TEXT NOT NULL
+        );
+        INSERT INTO analysis_runs (id, algorithm, created_at, status)
+        VALUES ('analysis_old', 'DBSCAN', '2026-01-01T00:00:00Z', 'completed');
+        CREATE TABLE failure_instances (
+            id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            cluster_id TEXT,
+            description TEXT NOT NULL,
+            severity TEXT NOT NULL,
+            timestamp TEXT NOT NULL
+        );
+        """
+    )
+    conn.close()
+
+    conn = aq_db.connect(db_path)
+    analysis_columns = {row["name"] for row in conn.execute("PRAGMA table_info(analysis_runs)")}
+    failure_columns = {row["name"] for row in conn.execute("PRAGMA table_info(failure_instances)")}
+    assert {"completed_at", "error_message", "selected_run_count", "failure_count", "cluster_count"} <= analysis_columns
+    assert "analysis_id" in failure_columns
+    assert conn.execute("SELECT status FROM analysis_runs WHERE id='analysis_old'").fetchone()["status"] == "completed"
+    assert conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='analysis_inputs'").fetchone()
+    conn.close()
     
     # 2. Call aq_db.connect(db_path) which triggers ensure_schema and migrations
     conn = aq_db.connect(db_path)

@@ -160,7 +160,23 @@ CREATE TABLE IF NOT EXISTS analysis_runs (
     judge_version TEXT,
     redaction_version TEXT,
     created_at TEXT NOT NULL,
-    status TEXT NOT NULL
+    status TEXT NOT NULL,
+    completed_at TEXT,
+    error_message TEXT,
+    selected_run_count INTEGER NOT NULL DEFAULT 0,
+    failure_count INTEGER NOT NULL DEFAULT 0,
+    cluster_count INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS analysis_inputs (
+    analysis_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    failure_count INTEGER NOT NULL DEFAULT 0,
+    error_type TEXT,
+    error_message TEXT,
+    PRIMARY KEY (analysis_id, run_id),
+    FOREIGN KEY(analysis_id) REFERENCES analysis_runs(id) ON DELETE CASCADE,
+    FOREIGN KEY(run_id) REFERENCES runs(id) ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS failure_cluster_memberships (
     analysis_id TEXT NOT NULL,
@@ -175,6 +191,7 @@ CREATE TABLE IF NOT EXISTS failure_cluster_memberships (
 );
 CREATE TABLE IF NOT EXISTS failure_instances (
     id TEXT PRIMARY KEY,
+    analysis_id TEXT,
     run_id TEXT NOT NULL,
     cluster_id TEXT,
     category TEXT,
@@ -186,6 +203,7 @@ CREATE TABLE IF NOT EXISTS failure_instances (
     affected_prompt_component TEXT,
     timestamp TEXT NOT NULL,
     llm_judge_score REAL,
+    FOREIGN KEY(analysis_id) REFERENCES analysis_runs(id) ON DELETE CASCADE,
     FOREIGN KEY(run_id) REFERENCES runs(id) ON DELETE CASCADE,
     FOREIGN KEY(cluster_id) REFERENCES failure_clusters(id) ON DELETE SET NULL
 );
@@ -356,6 +374,21 @@ TABLE_SCHEMAS: dict[str, frozenset[str]] = {
             "redaction_version",
             "created_at",
             "status",
+            "completed_at",
+            "error_message",
+            "selected_run_count",
+            "failure_count",
+            "cluster_count",
+        }
+    ),
+    "analysis_inputs": frozenset(
+        {
+            "analysis_id",
+            "run_id",
+            "status",
+            "failure_count",
+            "error_type",
+            "error_message",
         }
     ),
     "failure_cluster_memberships": frozenset(
@@ -370,6 +403,7 @@ TABLE_SCHEMAS: dict[str, frozenset[str]] = {
     "failure_instances": frozenset(
         {
             "id",
+            "analysis_id",
             "run_id",
             "cluster_id",
             "category",
@@ -464,6 +498,28 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     if columns and "provider_extensions" not in columns:
         conn.execute("ALTER TABLE failure_clusters ADD COLUMN provider_extensions TEXT;")
 
+    _add_missing_columns(
+        conn,
+        "analysis_runs",
+        {
+            "completed_at": "TEXT",
+            "error_message": "TEXT",
+            "selected_run_count": "INTEGER NOT NULL DEFAULT 0",
+            "failure_count": "INTEGER NOT NULL DEFAULT 0",
+            "cluster_count": "INTEGER NOT NULL DEFAULT 0",
+        },
+    )
+    _add_missing_columns(conn, "failure_instances", {"analysis_id": "TEXT REFERENCES analysis_runs(id) ON DELETE CASCADE"})
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_analysis_inputs_run_id ON analysis_inputs (run_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_failure_instances_analysis_id ON failure_instances (analysis_id)")
+
+
+def _add_missing_columns(conn: sqlite3.Connection, table: str, definitions: dict[str, str]) -> None:
+    columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    for name, definition in definitions.items():
+        if name not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+
 
 
 def one(conn: sqlite3.Connection, sql: str, args: Iterable[Any] = ()) -> sqlite3.Row | None:
@@ -485,3 +541,135 @@ def mark_session_ended(conn: sqlite3.Connection, session_id: str, outcome: str |
         "UPDATE sessions SET ended_at=?, final_outcome=COALESCE(?, final_outcome) WHERE id=?",
         (utc_now(), outcome, session_id),
     )
+
+
+def delete_chat(conn: sqlite3.Connection, chat_id: str) -> dict[str, Any]:
+    """Delete a stored chat/session or standalone run without touching files."""
+    session = conn.execute("SELECT id FROM sessions WHERE id=?", [chat_id]).fetchone()
+    if session:
+        chat_type = "session"
+        run_ids = [
+            row["id"]
+            for row in conn.execute("SELECT id FROM runs WHERE session_id=?", [chat_id]).fetchall()
+        ]
+    else:
+        run = conn.execute("SELECT id, session_id FROM runs WHERE id=?", [chat_id]).fetchone()
+        if not run or run["session_id"] not in (None, ""):
+            raise ValueError(f"unknown chat: {chat_id}")
+        chat_type = "standalone_run"
+        run_ids = [run["id"]]
+
+    cluster_ids = _cluster_ids_for_runs(conn, run_ids)
+    provider_artifact_ids = _provider_artifact_ids_for_chat(conn, chat_id, chat_type, run_ids)
+
+    _delete_where_in(conn, "provider_artifact_revisions", "artifact_id", provider_artifact_ids)
+    _delete_where_in(conn, "provider_artifacts", "id", provider_artifact_ids)
+    _delete_where_in(conn, "failure_cluster_memberships", "run_id", run_ids)
+    _delete_where_in(conn, "failure_instances", "run_id", run_ids)
+    _delete_where_in(conn, "analysis_inputs", "run_id", run_ids)
+    _delete_where_in(conn, "human_reviews", "run_id", run_ids)
+    _delete_where_in(conn, "verifier_results", "run_id", run_ids)
+    _delete_where_in(conn, "artifacts", "run_id", run_ids)
+
+    if chat_type == "session":
+        if run_ids:
+            placeholders = ", ".join("?" for _ in run_ids)
+            conn.execute(
+                f"DELETE FROM events WHERE session_id=? OR run_id IN ({placeholders})",
+                [chat_id, *run_ids],
+            )
+        else:
+            conn.execute("DELETE FROM events WHERE session_id=?", [chat_id])
+    else:
+        _delete_where_in(conn, "events", "run_id", run_ids)
+
+    _delete_where_in(conn, "runs", "id", run_ids)
+    if chat_type == "session":
+        conn.execute("DELETE FROM sessions WHERE id=?", [chat_id])
+
+    _refresh_cluster_counts(conn, cluster_ids)
+
+    return {
+        "deleted": True,
+        "chat_id": chat_id,
+        "chat_type": chat_type,
+        "run_count": len(run_ids),
+    }
+
+
+def delete_session(conn: sqlite3.Connection, session_id: str) -> dict[str, Any]:
+    return delete_chat(conn, session_id)
+
+
+def _delete_where_in(conn: sqlite3.Connection, table: str, column: str, values: Iterable[Any]) -> None:
+    values = list(values)
+    if not values:
+        return
+    placeholders = ", ".join("?" for _ in values)
+    conn.execute(f"DELETE FROM {table} WHERE {column} IN ({placeholders})", values)
+
+
+def _select_in(conn: sqlite3.Connection, sql_prefix: str, values: Iterable[Any]) -> list[sqlite3.Row]:
+    values = list(values)
+    if not values:
+        return []
+    placeholders = ", ".join("?" for _ in values)
+    return conn.execute(sql_prefix + f" ({placeholders})", values).fetchall()
+
+
+def _cluster_ids_for_runs(conn: sqlite3.Connection, run_ids: Iterable[str]) -> set[str]:
+    run_ids = list(run_ids)
+    cluster_ids: set[str] = set()
+    for row in _select_in(
+        conn,
+        "SELECT DISTINCT cluster_id FROM failure_instances WHERE cluster_id IS NOT NULL AND run_id IN",
+        run_ids,
+    ):
+        cluster_ids.add(row["cluster_id"])
+    for row in _select_in(
+        conn,
+        "SELECT DISTINCT cluster_id FROM failure_cluster_memberships WHERE run_id IN",
+        run_ids,
+    ):
+        cluster_ids.add(row["cluster_id"])
+    return cluster_ids
+
+
+def _provider_artifact_ids_for_chat(
+    conn: sqlite3.Connection,
+    chat_id: str,
+    chat_type: str,
+    run_ids: Iterable[str],
+) -> list[str]:
+    run_ids = list(run_ids)
+    conditions = []
+    args: list[Any] = []
+    if chat_type == "session":
+        conditions.append("session_id=?")
+        args.append(chat_id)
+    if run_ids:
+        conditions.append("run_id IN (" + ", ".join("?" for _ in run_ids) + ")")
+        args.extend(run_ids)
+    if not conditions:
+        return []
+    return [
+        row["id"]
+        for row in conn.execute(
+            "SELECT id FROM provider_artifacts WHERE " + " OR ".join(conditions),
+            args,
+        ).fetchall()
+    ]
+
+
+def _refresh_cluster_counts(conn: sqlite3.Connection, cluster_ids: Iterable[str]) -> None:
+    for cluster_id in cluster_ids:
+        conn.execute(
+            """
+            UPDATE failure_clusters
+            SET occurrence_count=(
+                SELECT COUNT(*) FROM failure_instances WHERE cluster_id=?
+            )
+            WHERE id=?
+            """,
+            [cluster_id, cluster_id],
+        )

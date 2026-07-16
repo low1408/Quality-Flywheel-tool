@@ -52,6 +52,11 @@
     selectedRunId: initialRunId,
     viewMode: "chats"
   };
+  const sidebarResize = {
+    max: 720,
+    min: 260,
+    storageKey: "agentQuality.sidebarWidth"
+  };
   const elements = {};
 
   document.addEventListener("DOMContentLoaded", init);
@@ -66,6 +71,8 @@
     elements.chatFilter = document.getElementById("chatFilter");
     elements.agentFilter = document.getElementById("agentFilter");
     elements.statusFilter = document.getElementById("statusFilter");
+    elements.workspace = document.querySelector(".workspace");
+    elements.sidebarResizer = document.getElementById("sidebarResizer");
     elements.detailPane = document.getElementById("detailPane");
     elements.modalBackdrop = document.getElementById("modalBackdrop");
     elements.modalTitle = document.getElementById("modalTitle");
@@ -76,7 +83,100 @@
     document.addEventListener("input", handleInput);
     document.addEventListener("change", handleChange);
     window.addEventListener("message", handleHostMessage);
+    initSidebarResize();
     loadRuns();
+  }
+
+  function initSidebarResize() {
+    if (!elements.workspace || !elements.sidebarResizer) {
+      return;
+    }
+    const savedWidth = Number(window.localStorage.getItem(sidebarResize.storageKey));
+    if (Number.isFinite(savedWidth) && savedWidth > 0) {
+      setSidebarWidth(savedWidth);
+    }
+    elements.sidebarResizer.addEventListener("pointerdown", startSidebarResize);
+    elements.sidebarResizer.addEventListener("keydown", handleSidebarResizeKeydown);
+  }
+
+  function startSidebarResize(event) {
+    if (event.button !== 0 || !elements.workspace) {
+      return;
+    }
+    event.preventDefault();
+    elements.sidebarResizer.setPointerCapture(event.pointerId);
+    elements.workspace.classList.add("is-resizing");
+
+    const move = (moveEvent) => {
+      setSidebarWidth(widthFromPointer(moveEvent.clientX));
+    };
+    const stop = () => {
+      elements.workspace.classList.remove("is-resizing");
+      elements.sidebarResizer.removeEventListener("pointermove", move);
+      elements.sidebarResizer.removeEventListener("pointerup", stop);
+      elements.sidebarResizer.removeEventListener("pointercancel", stop);
+      persistSidebarWidth();
+    };
+
+    elements.sidebarResizer.addEventListener("pointermove", move);
+    elements.sidebarResizer.addEventListener("pointerup", stop);
+    elements.sidebarResizer.addEventListener("pointercancel", stop);
+  }
+
+  function handleSidebarResizeKeydown(event) {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
+      return;
+    }
+    event.preventDefault();
+    const current = currentSidebarWidth();
+    const step = event.shiftKey ? 40 : 16;
+    let next = current;
+    if (event.key === "ArrowLeft") {
+      next = current - step;
+    } else if (event.key === "ArrowRight") {
+      next = current + step;
+    } else if (event.key === "Home") {
+      next = sidebarResize.min;
+    } else if (event.key === "End") {
+      next = maxSidebarWidth();
+    }
+    setSidebarWidth(next);
+    persistSidebarWidth();
+  }
+
+  function widthFromPointer(clientX) {
+    const rect = elements.workspace.getBoundingClientRect();
+    return clientX - rect.left;
+  }
+
+  function setSidebarWidth(width) {
+    const next = clamp(width, sidebarResize.min, maxSidebarWidth());
+    elements.workspace.style.setProperty("--rail-width", `${Math.round(next)}px`);
+    elements.sidebarResizer.setAttribute("aria-valuemin", String(sidebarResize.min));
+    elements.sidebarResizer.setAttribute("aria-valuemax", String(maxSidebarWidth()));
+    elements.sidebarResizer.setAttribute("aria-valuenow", String(Math.round(next)));
+  }
+
+  function currentSidebarWidth() {
+    const value = getComputedStyle(elements.workspace).getPropertyValue("--rail-width");
+    const parsed = Number.parseFloat(value);
+    return Number.isFinite(parsed) ? parsed : 360;
+  }
+
+  function maxSidebarWidth() {
+    const workspaceWidth = elements.workspace ? elements.workspace.getBoundingClientRect().width : 0;
+    if (!workspaceWidth) {
+      return sidebarResize.max;
+    }
+    return Math.max(sidebarResize.min, Math.min(sidebarResize.max, workspaceWidth - 280));
+  }
+
+  function persistSidebarWidth() {
+    window.localStorage.setItem(sidebarResize.storageKey, String(Math.round(currentSidebarWidth())));
+  }
+
+  function clamp(value, min, max) {
+    return Math.min(Math.max(value, min), max);
   }
 
   function handleHostMessage(event) {
@@ -124,7 +224,13 @@
     } else if (action === "saveReview") {
       saveReviewNow();
     } else if (action === "deleteChat") {
-      deleteSelectedChat();
+      deleteSelectedChat(target.dataset.chatId);
+    } else if (action === "copyTranscript") {
+      copyTranscript("full");
+    } else if (action === "copyCompactTranscript") {
+      copyTranscript("compact");
+    } else if (action === "copyNoToolsTranscript") {
+      copyTranscript("no-tools");
     } else if (action === "closeModal") {
       closeModal();
     }
@@ -279,18 +385,38 @@
         run.model || "",
         run.turn_count > 1 ? `${run.turn_count} turns` : ""
       ].filter(Boolean).join(" - ");
+      const deleteButton = vscode && state.viewMode === "chats"
+        ? `
+          <button
+            type="button"
+            class="run-delete-button"
+            data-action="deleteChat"
+            data-chat-id="${escapeAttr(run.id)}"
+            aria-label="Delete chat"
+            title="Delete chat"
+            ${state.deleting ? "disabled" : ""}
+          >
+            <svg aria-hidden="true" viewBox="0 0 24 24" focusable="false">
+              <path d="M9 3h6l1 2h4v2H4V5h4l1-2Zm-2 6h10l-.7 11H7.7L7 9Zm3 2v7h2v-7h-2Zm4 0v7h2v-7h-2Z"></path>
+            </svg>
+          </button>
+        `
+        : "";
       return `
-        <button type="button" class="run-card${active}" data-action="selectRun" data-run-id="${escapeAttr(run.id)}">
-          <span class="run-card-main">
-            <span class="run-title">${escapeHtml(prompt)}</span>
-            ${statusChip(run.verifier_status || "unverified")}
-          </span>
-          ${meta ? `<span class="run-meta">${escapeHtml(meta)}</span>` : ""}
-          <span class="status-row">
-            ${statusChip(run.agent_status || "agent_unknown")}
-            ${statusChip(run.human_status || "not_reviewed")}
-          </span>
-        </button>
+        <div class="run-card-row">
+          <button type="button" class="run-card${active}" data-action="selectRun" data-run-id="${escapeAttr(run.id)}">
+            <span class="run-card-main">
+              <span class="run-title">${escapeHtml(prompt)}</span>
+              ${statusChip(run.verifier_status || "unverified")}
+            </span>
+            ${meta ? `<span class="run-meta">${escapeHtml(meta)}</span>` : ""}
+            <span class="status-row">
+              ${statusChip(run.agent_status || "agent_unknown")}
+              ${statusChip(run.human_status || "not_reviewed")}
+            </span>
+          </button>
+          ${deleteButton}
+        </div>
       `;
     }).join("");
   }
@@ -370,6 +496,9 @@
           </div>
           <div class="detail-actions">
             ${deleteChatButton}
+            <button type="button" class="button ghost" data-action="copyTranscript">Copy Chat</button>
+            <button type="button" class="button ghost" data-action="copyCompactTranscript">Copy Compact</button>
+            <button type="button" class="button ghost" data-action="copyNoToolsTranscript">Copy No Tools</button>
             <button type="button" class="button ghost" data-action="openDiff">Open Diff</button>
             <button type="button" class="button primary" data-action="setTab" data-tab="review">Review</button>
           </div>
@@ -397,18 +526,95 @@
 
   function renderActiveTab(details) {
     if (state.activeTab === "verifiers") {
-      return renderVerifiers(details.verifier_results || details.all_verifier_results || []);
+      return renderVerifiers(detailItems(details, "verifier_results", "all_verifier_results"));
     }
     if (state.activeTab === "artifacts") {
-      return renderArtifacts(details.artifacts || details.all_artifacts || []);
+      return renderArtifacts(detailItems(details, "artifacts", "all_artifacts"));
     }
     if (state.activeTab === "timeline") {
-      return renderTimeline(details.events || details.all_events || []);
+      return renderTimeline(detailItems(details, "events", "all_events"));
     }
     if (state.activeTab === "review") {
       return renderReview(details);
     }
     return renderOverview(details);
+  }
+
+  function detailItems(details, key, legacyKey) {
+    if (Array.isArray(details[key])) {
+      return details[key];
+    }
+    if (Array.isArray(details.turns)) {
+      return details.turns.flatMap((turn) => Array.isArray(turn[key]) ? turn[key] : []);
+    }
+    return Array.isArray(details[legacyKey]) ? details[legacyKey] : [];
+  }
+
+  function buildChronologicalFeed(data) {
+    const feed = [];
+    const appendItems = (items, feedType) => {
+      (items || []).forEach((item) => {
+        feed.push({
+          ...item,
+          feedType,
+          feedIndex: feed.length
+        });
+      });
+    };
+
+    appendItems(data.agent_outputs, "agent_output");
+    appendItems(data.reasoning_trace, "reasoning");
+    appendItems(data.tool_calls, "tool_call");
+
+    return feed.sort(compareFeedItems);
+  }
+
+  function compareFeedItems(a, b) {
+    const timeA = feedTimestamp(a);
+    const timeB = feedTimestamp(b);
+    if (timeA !== timeB) {
+      return timeA - timeB;
+    }
+    const sequenceA = feedSequence(a);
+    const sequenceB = feedSequence(b);
+    if (sequenceA !== sequenceB) {
+      return sequenceA - sequenceB;
+    }
+    const eventA = a.event_id ? String(a.event_id) : "";
+    const eventB = b.event_id ? String(b.event_id) : "";
+    if (eventA && eventB && eventA !== eventB) {
+      return eventA.localeCompare(eventB);
+    }
+    return a.feedIndex - b.feedIndex;
+  }
+
+  function feedTimestamp(item) {
+    const value = Date.parse(item.occurred_at || "");
+    return Number.isFinite(value) ? value : Number.POSITIVE_INFINITY;
+  }
+
+  function feedSequence(item) {
+    const value = Number(item.sequence_number);
+    return Number.isFinite(value) ? value : Number.POSITIVE_INFINITY;
+  }
+
+  function renderExecutionFeed(data, headingId, options = {}) {
+    const feed = buildChronologicalFeed(data);
+    const headingTag = options.headingLevel === "h4" ? "h4" : "h3";
+    const note = options.includeNote === false ? "" : `
+      <p class="section-note">Shows assistant outputs, emitted reasoning summaries, and tool calls in captured chronological order. Private chain-of-thought remains encrypted by Codex and is not available to the collector.</p>
+    `;
+    return `
+      <section class="reading-section" aria-labelledby="${escapeAttr(headingId)}">
+        <${headingTag} id="${escapeAttr(headingId)}" class="section-title">Execution feed</${headingTag}>
+        ${note}
+        ${feed.length ? `
+          <div class="trace-list execution-feed">
+            ${feed.map((item) => renderFeedItem(item)).join("")}
+          </div>
+        ` : '<div class="empty-copy trace-empty">No execution events captured yet.</div>'}
+      </section>
+    `;
   }
 
   function renderOverview(details) {
@@ -419,10 +625,6 @@
           <div class="overview-primary">
             ${details.turns.map((turn, index) => {
               const run = turn.run;
-              const outputs = turn.agent_outputs || [];
-              const latestOutput = outputs.length ? outputs[outputs.length - 1] : null;
-              const reasoningTrace = turn.reasoning_trace || [];
-              const toolCalls = turn.tool_calls || [];
               return `
                 <div class="chat-turn-card">
                   <div class="chat-turn-header">Turn ${index + 1} (${escapeHtml(run.id)})</div>
@@ -430,23 +632,7 @@
                     <h3 id="prompt-heading-${run.id}" class="section-title">Prompt</h3>
                     <pre class="prompt-block reading-content">${escapeHtml(run.prompt || "No prompt captured.")}</pre>
                   </section>
-                  <section class="reading-section" aria-labelledby="output-heading-${run.id}">
-                    <h3 id="output-heading-${run.id}" class="section-title">Agent output</h3>
-                    ${latestOutput ? outputBlock(latestOutput) : '<div class="empty-copy reading-empty">No agent output captured yet.</div>'}
-                  </section>
-                  <details class="chat-turn-details">
-                    <summary>Reasoning & Tool Calls</summary>
-                    <div style="padding-top: 10px;">
-                      <section class="reading-section" aria-labelledby="reasoning-heading-${run.id}">
-                        <h4 id="reasoning-heading-${run.id}" class="section-subtitle" style="font-size: 12px; margin-bottom: 8px;">Reasoning trace</h4>
-                        ${reasoningTraceBlock(reasoningTrace)}
-                      </section>
-                      <section class="reading-section" aria-labelledby="tools-heading-${run.id}" style="margin-top: 16px;">
-                        <h4 id="tools-heading-${run.id}" class="section-subtitle" style="font-size: 12px; margin-bottom: 8px;">Tool calls</h4>
-                        ${toolCallsBlock(toolCalls)}
-                      </section>
-                    </div>
-                  </details>
+                  ${renderExecutionFeed(turn, `execution-heading-${run.id}`, { includeNote: false })}
                 </div>
               `;
             }).join("")}
@@ -466,10 +652,6 @@
     }
 
     const run = details.run;
-    const outputs = details.agent_outputs || [];
-    const latestOutput = outputs.length ? outputs[outputs.length - 1] : null;
-    const reasoningTrace = details.reasoning_trace || [];
-    const toolCalls = details.tool_calls || [];
     return `
       <div class="overview-stack">
         <div class="overview-primary">
@@ -477,19 +659,7 @@
             <h3 id="prompt-heading" class="section-title">Prompt</h3>
             <pre class="prompt-block reading-content">${escapeHtml(run.prompt || "No prompt captured.")}</pre>
           </section>
-          <section class="reading-section" aria-labelledby="output-heading">
-            <h3 id="output-heading" class="section-title">Agent output</h3>
-            ${latestOutput ? outputBlock(latestOutput) : '<div class="empty-copy reading-empty">No agent output captured yet.</div>'}
-          </section>
-          <section class="reading-section" aria-labelledby="reasoning-heading">
-            <h3 id="reasoning-heading" class="section-title">Reasoning trace</h3>
-            <p class="section-note">Shows emitted commentary and reasoning summaries. Private chain-of-thought remains encrypted by Codex and is not available to the collector.</p>
-            ${reasoningTraceBlock(reasoningTrace)}
-          </section>
-          <section class="reading-section" aria-labelledby="tools-heading">
-            <h3 id="tools-heading" class="section-title">Tool calls</h3>
-            ${toolCallsBlock(toolCalls)}
-          </section>
+          ${renderExecutionFeed(details, "execution-heading")}
         </div>
         <details class="overview-secondary">
           <summary>Run details</summary>
@@ -723,7 +893,7 @@
       await request("openDiff", { run_id: runId });
       return;
     }
-    const artifacts = state.details.artifacts || state.details.all_artifacts || [];
+    const artifacts = detailItems(state.details, "artifacts", "all_artifacts");
     const patch = artifacts.find((artifact) => ["final_patch", "diff", "patch"].includes(artifact.artifact_type));
     if (patch && patch.path) {
       await previewPath(patch.path);
@@ -732,8 +902,8 @@
     showModal("Diff", `aq diff ${runId}`);
   }
 
-  async function deleteSelectedChat() {
-    const chatId = state.selectedRunId;
+  async function deleteSelectedChat(chatId) {
+    chatId = chatId || state.selectedRunId;
     if (!vscode || state.viewMode !== "chats" || !chatId || state.deleting) {
       return;
     }
@@ -764,6 +934,60 @@
       setSync("Error");
       showModal("Delete Chat Failed", error.message || String(error));
     }
+  }
+
+  async function copyTranscript(mode) {
+    if (!state.details) {
+      return;
+    }
+    const isCompact = mode === "compact";
+    const excludesTools = mode === "no-tools";
+    const text = buildTranscriptMarkdown(state.details, {
+      compact: isCompact,
+      includeTools: !excludesTools,
+      textLimit: isCompact ? 6000 : 60000,
+      toolLimit: isCompact ? 2500 : 12000
+    });
+    setSync("Copying");
+    try {
+      if (vscode) {
+        await request("copyText", {
+          text,
+          label: transcriptCopyLabel(mode)
+        });
+      } else if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        showModal(transcriptCopyTitle(mode), text);
+        setSync("Idle");
+        return;
+      }
+      setSync("Copied");
+      window.setTimeout(() => setSync("Idle"), 1400);
+    } catch (error) {
+      setSync("Copy failed");
+      showModal("Copy failed", error.message || String(error));
+    }
+  }
+
+  function transcriptCopyLabel(mode) {
+    if (mode === "compact") {
+      return "compact chat transcript";
+    }
+    if (mode === "no-tools") {
+      return "chat transcript without tool executions";
+    }
+    return "chat transcript";
+  }
+
+  function transcriptCopyTitle(mode) {
+    if (mode === "compact") {
+      return "Compact Chat Transcript";
+    }
+    if (mode === "no-tools") {
+      return "Chat Transcript Without Tool Executions";
+    }
+    return "Chat Transcript";
   }
 
   async function request(command, payload) {
@@ -855,6 +1079,51 @@
     `;
   }
 
+  function renderFeedItem(item) {
+    if (item.feedType === "agent_output") {
+      return `
+        <article class="trace-entry reasoning-entry execution-feed-item">
+          <div class="trace-head">
+            <span class="trace-kind">Agent output</span>
+            ${item.occurred_at ? `<time>${escapeHtml(formatDate(item.occurred_at))}</time>` : ""}
+          </div>
+          <pre class="trace-content">${escapeHtml(item.text || "")}</pre>
+          ${fileLinksBlock(item.file_links || [])}
+        </article>
+      `;
+    }
+    if (item.feedType === "reasoning") {
+      return `
+        <article class="trace-entry reasoning-entry execution-feed-item">
+          <div class="trace-head">
+            <span class="trace-kind">Reasoning ${escapeHtml(humanize(item.kind || "summary"))}</span>
+            ${item.occurred_at ? `<time>${escapeHtml(formatDate(item.occurred_at))}</time>` : ""}
+          </div>
+          <pre class="trace-content">${escapeHtml(item.text || "")}</pre>
+        </article>
+      `;
+    }
+    if (item.feedType === "tool_call") {
+      return `
+        <details class="trace-entry tool-entry execution-feed-item">
+          <summary>
+            <span class="tool-name">Tool: ${escapeHtml(item.tool_name || "tool")}</span>
+            <span class="status-row">
+              ${item.occurred_at ? `<span class="output-meta">${escapeHtml(formatDate(item.occurred_at))}</span>` : ""}
+              ${item.tool_category ? statusChip(item.tool_category) : ""}
+              ${statusChip(item.status || "observed")}
+            </span>
+          </summary>
+          <div class="tool-detail">
+            ${traceValue("Input", item.input)}
+            ${traceValue("Output", item.output)}
+          </div>
+        </details>
+      `;
+    }
+    return "";
+  }
+
   function reasoningTraceBlock(trace) {
     if (!trace.length) {
       return '<div class="empty-copy trace-empty">No emitted reasoning summaries or commentary captured.</div>';
@@ -911,6 +1180,108 @@
         <pre class="trace-content">${escapeHtml(compact(text, 12000))}</pre>
       </div>
     `;
+  }
+
+  function buildTranscriptMarkdown(details, options) {
+    const includeTools = options.includeTools !== false;
+    const exportKind = options.compact ? "compact" : includeTools ? "full bounded" : "full bounded without tool executions";
+    const includedContent = includeTools
+      ? "captured prompts, assistant outputs, emitted reasoning summaries, and tool calls"
+      : "captured prompts, assistant outputs, and emitted reasoning summaries. Tool calls are excluded";
+    const turns = details.turns || [{
+      run: details.run,
+      agent_outputs: details.agent_outputs || [],
+      reasoning_trace: details.reasoning_trace || [],
+      tool_calls: details.tool_calls || [],
+      verifier_results: details.verifier_results || [],
+      human_reviews: details.human_reviews || []
+    }];
+    const subject = details.session || details.run || {};
+    const lines = [
+      "# Agent Quality Chat Transcript",
+      "",
+      `- Export: ${exportKind}`,
+      `- Chat ID: ${subject.id || "n/a"}`,
+      `- Repository: ${subject.repository_path || "n/a"}`,
+      `- Started: ${formatDate(subject.started_at)}`,
+      `- Ended: ${formatDate(subject.ended_at || subject.completed_at)}`,
+      `- Turns: ${turns.length}`,
+      "",
+      `> Note: this export includes ${includedContent}. Private chain-of-thought is not available to Agent Quality.`,
+      ""
+    ];
+
+    turns.forEach((turn, index) => {
+      const run = turn.run || {};
+      lines.push(`## Turn ${index + 1}`);
+      lines.push("");
+      lines.push(`- Run ID: ${run.id || "n/a"}`);
+      lines.push(`- Model: ${run.model || "n/a"}`);
+      lines.push(`- Agent: ${run.agent_adapter || "n/a"}`);
+      lines.push(`- Status: ${[run.agent_status, run.verifier_status, run.human_status].filter(Boolean).join(" / ") || "n/a"}`);
+      lines.push("");
+      pushSection(lines, "Prompt", run.prompt || "No prompt captured.", options.textLimit);
+
+      const feed = buildChronologicalFeed(turn).filter((item) => includeTools || item.feedType !== "tool_call");
+      if (feed.length) {
+        lines.push("### Execution feed");
+        lines.push("");
+        feed.forEach((item, feedIndex) => pushTranscriptFeedItem(lines, item, feedIndex, options));
+      } else {
+        pushSection(lines, "Execution feed", includeTools ? "No execution events captured." : "No non-tool execution events captured.", options.textLimit);
+      }
+    });
+
+    return lines.join("\n").replace(/\n{4,}/g, "\n\n\n").trim() + "\n";
+  }
+
+  function pushTranscriptFeedItem(lines, item, index, options) {
+    if (item.feedType === "agent_output") {
+      lines.push(`#### ${index + 1}. Agent output${item.occurred_at ? ` - ${formatDate(item.occurred_at)}` : ""}`);
+      lines.push("");
+      lines.push(fence(compact(item.text || "", options.textLimit)));
+      lines.push("");
+      return;
+    }
+    if (item.feedType === "reasoning") {
+      lines.push(`#### ${index + 1}. Reasoning ${item.kind || "summary"}${item.occurred_at ? ` - ${formatDate(item.occurred_at)}` : ""}`);
+      lines.push("");
+      lines.push(fence(compact(item.text || "", options.toolLimit)));
+      lines.push("");
+      return;
+    }
+    if (item.feedType === "tool_call") {
+      lines.push(`#### ${index + 1}. Tool call: ${item.tool_name || "tool"}`);
+      lines.push("");
+      lines.push(`- Category: ${item.tool_category || "n/a"}`);
+      lines.push(`- Status: ${item.status || "n/a"}`);
+      lines.push(`- Occurred: ${formatDate(item.occurred_at)}`);
+      pushSection(lines, "Input", stringifyForTranscript(item.input), options.toolLimit);
+      pushSection(lines, "Output", stringifyForTranscript(item.output), options.toolLimit);
+    }
+  }
+
+  function pushSection(lines, title, content, limit) {
+    lines.push(`### ${title}`);
+    lines.push("");
+    lines.push(fence(compact(content || "n/a", limit)));
+    lines.push("");
+  }
+
+  function fence(content) {
+    const text = String(content || "");
+    const marker = text.includes("```") ? "````" : "```";
+    return `${marker}\n${text}\n${marker}`;
+  }
+
+  function stringifyForTranscript(value) {
+    if (value === null || value === undefined || value === "") {
+      return "n/a";
+    }
+    if (typeof value === "string") {
+      return value;
+    }
+    return JSON.stringify(value, null, 2);
   }
 
   function eventSummary(event) {

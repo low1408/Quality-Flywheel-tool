@@ -90,6 +90,11 @@ echo "using python: $(${python_bin} -c 'import sys; print(sys.executable)')"
 if [[ ${install_package} -eq 1 ]]; then
   echo "installing package in editable mode"
   "${python_bin}" -m pip install -e "${repo}"
+  flywheel_repo="$(cd -- "${repo}/.." && pwd)/kimi_coding_agent_flywheel"
+  if [[ -f "${flywheel_repo}/pyproject.toml" ]]; then
+    echo "installing Kimi flywheel worker in editable mode"
+    "${python_bin}" -m pip install -e "${flywheel_repo}"
+  fi
 fi
 
 aq_home="${repo}/.agent-quality/local"

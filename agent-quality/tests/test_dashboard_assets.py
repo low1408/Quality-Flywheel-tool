@@ -10,6 +10,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MEDIA_DIR = PROJECT_ROOT / "vscode-extension" / "media"
 STATIC_DIR = PROJECT_ROOT / "src" / "agent_quality" / "collector" / "static"
 EXTENSION_SOURCE = PROJECT_ROOT / "vscode-extension" / "src" / "extension.js"
+EXTENSION_PACKAGE = PROJECT_ROOT / "vscode-extension" / "package.json"
 
 
 @pytest.mark.parametrize("asset", ["dashboard.html", "dashboard.css", "dashboard.js"])
@@ -31,12 +32,13 @@ def test_dashboard_keeps_machine_fields_out_of_the_primary_ui():
         assert token_label not in overview
 
     prompt_position = overview.index('aria-labelledby="prompt-heading"')
-    output_position = overview.index('aria-labelledby="output-heading"')
-    reasoning_position = overview.index('aria-labelledby="reasoning-heading"')
-    tools_position = overview.index('aria-labelledby="tools-heading"')
+    feed_position = overview.index('renderExecutionFeed(details, "execution-heading")')
     details_position = overview.index('<details class="overview-secondary">')
-    assert prompt_position < output_position < reasoning_position < tools_position < details_position
-    assert "Private chain-of-thought remains encrypted" in overview
+    assert prompt_position < feed_position < details_position
+    assert "renderExecutionFeed(turn" in overview
+    assert "buildChronologicalFeed" in source
+    assert "feedTimestamp" in source
+    assert "Private chain-of-thought remains encrypted" in source
 
 
 def test_delete_chat_control_is_vscode_chat_only():
@@ -47,6 +49,63 @@ def test_delete_chat_control_is_vscode_chat_only():
     assert 'request("deleteChat", { chat_id: chatId })' in source
     assert 'if (command === "deleteChat")' not in source
     assert 'if (command !== "deleteChat")' in source
+
+
+def test_dashboard_can_copy_transcript_without_tool_executions():
+    source = (MEDIA_DIR / "dashboard.js").read_text(encoding="utf-8")
+
+    assert 'data-action="copyNoToolsTranscript"' in source
+    assert 'copyTranscript("no-tools")' in source
+    assert "chat transcript without tool executions" in source
+    assert "full bounded without tool executions" in source
+    assert 'includeTools: !excludesTools' in source
+    assert 'item.feedType !== "tool_call"' in source
+
+
+def test_dashboard_details_compacts_large_payloads(tmp_path, monkeypatch):
+    from agent_quality.db import connect
+
+    monkeypatch.setenv("AGENT_QUALITY_HOME", str(tmp_path / "aq"))
+    db_path = tmp_path / "quality.sqlite3"
+    big_text = "x" * 1_200_000
+    conn = connect(db_path)
+    with conn:
+        _insert_run(conn, "run_large", None)
+        _insert_event(conn, "evt_large", run_id="run_large", session_id=None)
+        conn.execute(
+            """
+            UPDATE events
+            SET normalized_payload=?,
+                source_payload_sanitized=?,
+                provider_extensions=?
+            WHERE id='evt_large'
+            """,
+            [
+                json.dumps(
+                    {
+                        "assistant_output": big_text,
+                        "reasoning": big_text,
+                        "tool_input": {"prompt": big_text},
+                        "tool_output": big_text,
+                    }
+                ),
+                json.dumps({"raw": big_text}),
+                json.dumps({"openai.codex.hook": {"last_assistant_message": big_text}}),
+            ],
+        )
+    conn.close()
+
+    result = _run_dashboard_action(db_path, "details", {"run_id": "run_large"})
+
+    assert result.returncode == 0, result.stderr
+    assert len(result.stdout) < 250_000
+    payload = json.loads(result.stdout)
+    event = payload["events"][0]
+    assert len(event["normalized_payload"]) < 2500
+    assert "[truncated:" in event["normalized_payload"]
+    assert len(event["normalized_payload_json"]["assistant_output"]) < 13000
+    assert "[truncated:" in payload["agent_outputs"][0]["text"]
+    assert len(payload["agent_outputs"][0]["text"]) < 61000
 
 
 def test_delete_chat_confirmation_precedes_database_mutation():
@@ -60,6 +119,21 @@ def test_delete_chat_confirmation_precedes_database_mutation():
     mutation = handler.index('dashboardDbQuery(folder, "delete_chat"')
     assert confirmation < cancellation < mutation
     assert 'deleted: false' in handler
+
+
+def test_flywheel_panel_is_vscode_only_and_uses_external_worker():
+    source = EXTENSION_SOURCE.read_text(encoding="utf-8")
+    package = json.loads(EXTENSION_PACKAGE.read_text(encoding="utf-8"))
+
+    assert "class FlywheelPanel" in source
+    assert 'shell: false' in source
+    assert 'dashboardDbQuery(folder, "flywheel_candidates"' in source
+    assert 'DashboardPanel.show(this.context, message.run_id, "overview")' in source
+    assert "flywheel.html" not in (STATIC_DIR / "dashboard.html").read_text(encoding="utf-8")
+    assert any(command["command"] == "agentQuality.showFlywheel" for command in package["contributes"]["commands"])
+    properties = package["contributes"]["configuration"]["properties"]
+    assert properties["agentQuality.flywheelJudgeCommand"]["type"] == "array"
+    assert properties["agentQuality.flywheelMinClusterSize"]["minimum"] == 2
 
 
 def test_delete_chat_removes_session_records_but_preserves_files_and_global_metadata(tmp_path, monkeypatch):

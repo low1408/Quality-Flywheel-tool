@@ -229,6 +229,12 @@
       copyTranscript("full");
     } else if (action === "copyCompactTranscript") {
       copyTranscript("compact");
+    } else if (action === "copyNoToolsTranscript") {
+      copyTranscript("no-tools");
+    } else if (action === "copyJudgeTranscript") {
+      copyTranscript("judge");
+    } else if (action === "copyJudgeNoToolsTranscript") {
+      copyTranscript("judge-no-tools");
     } else if (action === "closeModal") {
       closeModal();
     }
@@ -495,7 +501,9 @@
           <div class="detail-actions">
             ${deleteChatButton}
             <button type="button" class="button ghost" data-action="copyTranscript">Copy Chat</button>
-            <button type="button" class="button ghost" data-action="copyCompactTranscript">Copy Compact</button>
+            <button type="button" class="button ghost" data-action="copyNoToolsTranscript">Copy No Tools</button>
+            <button type="button" class="button ghost" data-action="copyJudgeTranscript">Copy for Judge</button>
+            <button type="button" class="button ghost" data-action="copyJudgeNoToolsTranscript">Copy for Judge (No Tools)</button>
             <button type="button" class="button ghost" data-action="openDiff">Open Diff</button>
             <button type="button" class="button primary" data-action="setTab" data-tab="review">Review</button>
           </div>
@@ -938,22 +946,60 @@
       return;
     }
     const isCompact = mode === "compact";
-    const text = buildTranscriptMarkdown(state.details, {
+    const excludesTools = mode === "no-tools" || mode === "judge-no-tools";
+    const rawTranscript = buildTranscriptMarkdown(state.details, {
       compact: isCompact,
+      includeTools: !excludesTools,
       textLimit: isCompact ? 6000 : 60000,
       toolLimit: isCompact ? 2500 : 12000
     });
+
+    let text = rawTranscript;
+    if (mode === "judge" || mode === "judge-no-tools") {
+      const systemPrompt = `You are an expert AI systems debugger.
+
+Analyze the following agent execution trace and identify ALL failures.
+
+For each failure, provide:
+1. Subcategory (choose from: skipping_validation, code_syntax_error, API_error, model_limitation, prompt_issue, tool_issue, other)
+2. Severity (low/medium/high/critical)
+3. A 2-3 sentence diagnostic description
+4. The likely root cause
+5. A specific suggestion for fixing it
+6. The affected prompt component (e.g. system_prompt, user_prompt, etc. or null)
+
+Format your response as a valid JSON object matching this schema:
+{
+  "overall_score": float,
+  "failures": [
+    {
+      "subcategory": "string",
+      "severity": "low|medium|high|critical",
+      "description": "string",
+      "root_cause": "string",
+      "suggested_fix": "string",
+      "affected_prompt_component": "string"
+    }
+  ],
+  "summary": "string"
+}
+
+Here is the trace:
+`;
+      text = systemPrompt + "\n" + rawTranscript;
+    }
+
     setSync("Copying");
     try {
       if (vscode) {
         await request("copyText", {
           text,
-          label: isCompact ? "compact chat transcript" : "chat transcript"
+          label: transcriptCopyLabel(mode)
         });
       } else if (navigator.clipboard && navigator.clipboard.writeText) {
         await navigator.clipboard.writeText(text);
       } else {
-        showModal(isCompact ? "Compact Chat Transcript" : "Chat Transcript", text);
+        showModal(transcriptCopyTitle(mode), text);
         setSync("Idle");
         return;
       }
@@ -963,6 +1009,38 @@
       setSync("Copy failed");
       showModal("Copy failed", error.message || String(error));
     }
+  }
+
+  function transcriptCopyLabel(mode) {
+    if (mode === "compact") {
+      return "compact chat transcript";
+    }
+    if (mode === "no-tools") {
+      return "chat transcript without tool executions";
+    }
+    if (mode === "judge") {
+      return "judge prompt with chat transcript";
+    }
+    if (mode === "judge-no-tools") {
+      return "judge prompt with chat transcript (no tools)";
+    }
+    return "chat transcript";
+  }
+
+  function transcriptCopyTitle(mode) {
+    if (mode === "compact") {
+      return "Compact Chat Transcript";
+    }
+    if (mode === "no-tools") {
+      return "Chat Transcript Without Tool Executions";
+    }
+    if (mode === "judge") {
+      return "LLM Judge Prompt";
+    }
+    if (mode === "judge-no-tools") {
+      return "LLM Judge Prompt (No Tools)";
+    }
+    return "Chat Transcript";
   }
 
   async function request(command, payload) {
@@ -1158,6 +1236,11 @@
   }
 
   function buildTranscriptMarkdown(details, options) {
+    const includeTools = options.includeTools !== false;
+    const exportKind = options.compact ? "compact" : includeTools ? "full bounded" : "full bounded without tool executions";
+    const includedContent = includeTools
+      ? "captured prompts, assistant outputs, emitted reasoning summaries, and tool calls"
+      : "captured prompts, assistant outputs, and emitted reasoning summaries. Tool calls are excluded";
     const turns = details.turns || [{
       run: details.run,
       agent_outputs: details.agent_outputs || [],
@@ -1170,14 +1253,14 @@
     const lines = [
       "# Agent Quality Chat Transcript",
       "",
-      `- Export: ${options.compact ? "compact" : "full bounded"}`,
+      `- Export: ${exportKind}`,
       `- Chat ID: ${subject.id || "n/a"}`,
       `- Repository: ${subject.repository_path || "n/a"}`,
       `- Started: ${formatDate(subject.started_at)}`,
       `- Ended: ${formatDate(subject.ended_at || subject.completed_at)}`,
       `- Turns: ${turns.length}`,
       "",
-      "> Note: this export includes captured prompts, assistant outputs, emitted reasoning summaries, and tool calls. Private chain-of-thought is not available to Agent Quality.",
+      `> Note: this export includes ${includedContent}. Private chain-of-thought is not available to Agent Quality.`,
       ""
     ];
 
@@ -1192,13 +1275,13 @@
       lines.push("");
       pushSection(lines, "Prompt", run.prompt || "No prompt captured.", options.textLimit);
 
-      const feed = buildChronologicalFeed(turn);
+      const feed = buildChronologicalFeed(turn).filter((item) => includeTools || item.feedType !== "tool_call");
       if (feed.length) {
         lines.push("### Execution feed");
         lines.push("");
         feed.forEach((item, feedIndex) => pushTranscriptFeedItem(lines, item, feedIndex, options));
       } else {
-        pushSection(lines, "Execution feed", "No execution events captured.", options.textLimit);
+        pushSection(lines, "Execution feed", includeTools ? "No execution events captured." : "No non-tool execution events captured.", options.textLimit);
       }
     });
 

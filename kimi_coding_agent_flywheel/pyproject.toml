@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kimi-coding-agent-flywheel"
+version = "0.1.0"
+description = "Failure diagnosis and clustering worker for Agent Quality."
+requires-python = ">=3.11"
+dependencies = [
+  "agent-quality>=0.1.0",
+  "numpy>=1.26",
+  "scikit-learn>=1.3",
+]
+
+[project.scripts]
+aq-flywheel = "kimi_coding_agent_flywheel.cli:main"
+
+[tool.setuptools]
+packages = [
+  "kimi_coding_agent_flywheel",
+  "kimi_coding_agent_flywheel.clustering",
+  "kimi_coding_agent_flywheel.core",
+  "kimi_coding_agent_flywheel.eval",
+  "kimi_coding_agent_flywheel.examples",
+  "kimi_coding_agent_flywheel.monitoring",
+  "kimi_coding_agent_flywheel.optimization",
+  "kimi_coding_agent_flywheel.regression",
+]
+
+[tool.setuptools.package-dir]
+kimi_coding_agent_flywheel = "."

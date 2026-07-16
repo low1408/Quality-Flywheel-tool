@@ -205,6 +205,7 @@ class FailureInstance:
     timestamp: datetime = field(default_factory=utc_now)
     llm_judge_score: float | None = None  # 0-10 from LLM judge
     embedding: list[float] | None = None   # Vector representation for clustering
+    cluster_confidence: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -226,6 +227,7 @@ class FailureInstance:
             "timestamp": self.timestamp.isoformat(),
             "llm_judge_score": self.llm_judge_score,
             "embedding": self.embedding,
+            "cluster_confidence": self.cluster_confidence,
         }
 
     @classmethod
@@ -262,6 +264,7 @@ class FailureInstance:
             timestamp=parsed_timestamp,
             llm_judge_score=data.get("llm_judge_score"),
             embedding=data.get("embedding"),
+            cluster_confidence=data.get("cluster_confidence"),
         )
 
 
@@ -270,6 +273,8 @@ class EmbeddedFailure:
     """A failure and the exact text used to embed it."""
     failure: FailureInstance
     embedding_text: str
+    causal_text: str = ""
+    surface_text: str = ""
 
 
 @dataclass
@@ -297,6 +302,7 @@ class FailureCluster:
     suggested_prompt_fix: str = ""
     suggested_tool_fix: str = ""
     regression_tests_needed: list[str] = field(default_factory=list)
+    assignment_type: str = "dbscan"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -314,6 +320,7 @@ class FailureCluster:
             "suggested_prompt_fix": self.suggested_prompt_fix,
             "suggested_tool_fix": self.suggested_tool_fix,
             "regression_tests_needed": self.regression_tests_needed,
+            "assignment_type": self.assignment_type,
         }
 
 
@@ -470,7 +477,7 @@ Format your response as JSON:
             agent_name=trace_data.get("agent_name", "unknown"),
             model_id=trace_data.get("model_id", "unknown"),
             task_description=task_description,
-            system_prompt=trace_data.get("system_prompt", "N/A")[:2000],
+            system_prompt=(trace_data.get("system_prompt") or "N/A")[:2000],
             trace_snippet=self._extract_relevant_trace(trace_data)[:3000],
             error_output=self._extract_errors(trace_data),
             failure_types=self._failure_type_list,
@@ -716,6 +723,83 @@ Format your response as JSON:
 # Failure Clustering Engine
 # -----------------------------------------------------------------------------
 
+HUMAN_CAUSE_LABELS: dict[str, str] = {
+    "prompt_underspecification": "Prompt Underspecification / Ambiguous Requirements",
+    "tool_execution_error": "Tool Execution / Selection Error",
+    "verification_failure": "Verification / Validation Failure",
+    "implementation_defect": "Implementation / Code Defect",
+    "dependency_failure": "Environment / Dependency Setup Failure",
+}
+
+
+def normalize_root_cause(text: str) -> str:
+    """Normalize free-text root causes into standard taxonomy codes."""
+    if not text:
+        return ""
+    text = text.lower().strip()
+    text = re.sub(r'\s+', ' ', text)
+    
+    mappings = {
+        "vague prompt": "prompt_underspecification",
+        "underspecified requirements": "prompt_underspecification",
+        "missing acceptance criteria": "prompt_underspecification",
+        "ambiguous task": "prompt_underspecification",
+        "ambiguous prompt": "prompt_underspecification",
+        "missing requirements": "prompt_underspecification",
+        "requirements were underspecified": "prompt_underspecification",
+        "prompt issue": "prompt_underspecification",
+        
+        "tool selection error": "tool_execution_error",
+        "tool selection": "tool_execution_error",
+        "incorrect tool arguments": "tool_execution_error",
+        "wrong tool selected": "tool_execution_error",
+        "tool arguments": "tool_execution_error",
+        "tool execution": "tool_execution_error",
+        "tool error": "tool_execution_error",
+        "tool issue": "tool_execution_error",
+        
+        "missing validation": "verification_failure",
+        "skipping validation": "verification_failure",
+        "no validation": "verification_failure",
+        "premature stop": "verification_failure",
+        "premature completion": "verification_failure",
+        "verification": "verification_failure",
+        
+        "implementation defect": "implementation_defect",
+        "code logic error": "implementation_defect",
+        "code syntax error": "implementation_defect",
+        "syntax error": "implementation_defect",
+        "logic error": "implementation_defect",
+        "model limitation": "implementation_defect",
+        
+        "dependency failure": "dependency_failure",
+        "missing dependency": "dependency_failure",
+        "environment failure": "dependency_failure",
+        "setup failure": "dependency_failure",
+    }
+    
+    for key, val in mappings.items():
+        if key in text:
+            return val
+            
+    text = re.sub(r'[^a-z0-9\s_]', '', text)
+    text = re.sub(r'\s+', '_', text.strip())
+    return text
+
+
+def normalize_error_message(text: str) -> str:
+    """Strip volatile paths, numbers, hex addresses, and hashes from error messages."""
+    if not text:
+        return ""
+    text = text.lower().strip()
+    text = re.sub(r'/[^:\s]+/([^:\s]+)', r'\1', text)
+    text = re.sub(r'\bline \d+\b', 'line', text)
+    text = re.sub(r'\b0x[a-f0-9]+\b', 'hex_addr', text)
+    text = re.sub(r'\b[a-f0-9]{32,}\b', 'hash_val', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text
+
+
 class FailureClusteringEngine:
     """
     Clusters failures by semantic similarity using embeddings.
@@ -747,6 +831,7 @@ class FailureClusteringEngine:
         self._embedded_failures: list[EmbeddedFailure] = []
         self._failure_ids: set[str] = set()
         self._embeddings: np.ndarray | None = None
+        self.algorithm_used: str = "dbscan"
 
     def add_failures(self, failures: list[FailureInstance]) -> None:
         """Add failures to the clustering engine."""
@@ -779,27 +864,24 @@ class FailureClusteringEngine:
         if len(embedded_failures) < self.min_cluster_size:
             self.clusters = []
             self._embeddings = None
+            self.algorithm_used = "dbscan"
             return []
 
         embedding_texts = [item.embedding_text for item in embedded_failures]
 
         # Generate embeddings
-        embeddings = self.embedding_fn(embedding_texts)
+        try:
+            embeddings = self.embedding_fn(embedding_texts)
+        except Exception as e:
+            raise RuntimeError(f"Clustering feature extraction failed: {e}") from e
         self._embeddings = np.array(embeddings)
         for embedded_failure, embedding in zip(embedded_failures, embeddings):
             embedded_failure.failure.embedding = list(embedding)
 
-        # Cluster using HDBSCAN or DBSCAN
-        if len(embedded_failures) >= 10:
-            try:
-                clusterer = HDBSCAN(min_cluster_size=self.min_cluster_size, metric="euclidean")
-                labels = clusterer.fit_predict(self._embeddings)
-            except ImportError:
-                clusterer = DBSCAN(eps=self.eps, min_samples=self.min_cluster_size, metric="cosine")
-                labels = clusterer.fit_predict(self._embeddings)
-        else:
-            clusterer = DBSCAN(eps=self.eps, min_samples=self.min_cluster_size, metric="cosine")
-            labels = clusterer.fit_predict(self._embeddings)
+        # DBSCAN with cosine distance is default for all sizes to eliminate discontinuity
+        clusterer = DBSCAN(eps=self.eps, min_samples=self.min_cluster_size, metric="cosine")
+        labels = clusterer.fit_predict(self._embeddings)
+        self.algorithm_used = "dbscan"
 
         # Group failures by cluster
         cluster_groups: dict[int, list[tuple[int, FailureInstance]]] = defaultdict(list)
@@ -810,9 +892,34 @@ class FailureClusteringEngine:
         # Build FailureCluster objects
         self.clusters = []
         for cluster_id, items in cluster_groups.items():
-            indices, failures = zip(*items)
-            cluster = self._build_cluster(cluster_id, list(failures), list(indices))
+            indices, failures_list = zip(*items)
+            cluster = self._build_cluster(cluster_id, list(failures_list), list(indices))
+            cluster.assignment_type = self.algorithm_used
             self.clusters.append(cluster)
+
+        # Calculate centroids and confidence for each cluster
+        for cluster in self.clusters:
+            embeddings_list = [f.embedding for f in cluster.failures if f.embedding]
+            if not embeddings_list:
+                for f in cluster.failures:
+                    f.cluster_confidence = 1.0
+                continue
+            
+            centroid = np.mean(np.array(embeddings_list), axis=0)
+            centroid_norm = np.linalg.norm(centroid)
+            if centroid_norm > 0:
+                centroid = centroid / centroid_norm
+
+            for f in cluster.failures:
+                if f.embedding:
+                    f_arr = np.array(f.embedding)
+                    f_norm = np.linalg.norm(f_arr)
+                    if f_norm > 0:
+                        f_arr = f_arr / f_norm
+                    sim = float(np.dot(f_arr, centroid))
+                    f.cluster_confidence = max(0.0, min(1.0, sim))
+                else:
+                    f.cluster_confidence = 1.0
 
         return self.clusters
 
@@ -822,8 +929,30 @@ class FailureClusteringEngine:
 
     def _embed_failure(self, failure: FailureInstance) -> EmbeddedFailure:
         """Create the embedding text and keep it attached to the source failure."""
-        text = f"Task: {failure.task_id}. Failure: {failure.description}. Error: {failure.error_message}"
-        return EmbeddedFailure(failure=failure, embedding_text=text)
+        norm_cause = normalize_root_cause(failure.probable_cause)
+        norm_desc = failure.description.lower().strip()
+        norm_error = normalize_error_message(failure.error_message)
+
+        causal_parts = []
+        if failure.category:
+            causal_parts.append(f"category {failure.category}")
+        if failure.subcategory:
+            causal_parts.append(f"subcategory {failure.subcategory}")
+        if norm_cause:
+            causal_parts.append(f"cause {norm_cause}")
+        if failure.affected_prompt_component:
+            causal_parts.append(f"prompt {failure.affected_prompt_component}")
+
+        causal_text = " ".join(causal_parts)
+        surface_text = f"desc {norm_desc} error {norm_error}"
+        text = f"{causal_text} | {surface_text}"
+
+        return EmbeddedFailure(
+            failure=failure,
+            embedding_text=text,
+            causal_text=causal_text,
+            surface_text=surface_text,
+        )
 
     def _build_cluster(self, cluster_id: int, failures: list[FailureInstance], indices: list[int]) -> FailureCluster:
         """Build a FailureCluster from grouped failures."""
@@ -834,9 +963,17 @@ class FailureClusteringEngine:
         dominant_category = category_counts.most_common(1)[0][0] if category_counts else None
         dominant_subcategory = subcategory_counts.most_common(1)[0][0] if subcategory_counts else None
 
+        # Determine dominant cause
+        cause_counts = Counter(normalize_root_cause(f.probable_cause) for f in failures if f.probable_cause)
+        dominant_cause = cause_counts.most_common(1)[0][0] if cause_counts else None
+
         # Extract common keywords from descriptions
         all_descriptions = " ".join(f.description for f in failures)
         keywords = self._extract_keywords(all_descriptions)
+
+        # Extract common keywords from probable causes (causal keywords)
+        all_causes = " ".join(f.probable_cause for f in failures if f.probable_cause)
+        causal_keywords = self._extract_keywords(all_causes) if all_causes else []
 
         # Extract common tool calls
         tool_calls = []
@@ -852,8 +989,10 @@ class FailureClusteringEngine:
         severity_map = {1: "low", 2: "medium", 3: "high", 4: "critical"}
         avg_severity = severity_map.get(round(avg_sev_score), "medium")
 
-        # Generate cluster label
-        label = self._generate_cluster_label(dominant_subcategory, keywords, len(failures))
+        # Generate cluster label using cause-first approach
+        label = self._generate_cluster_label(
+            dominant_cause, dominant_subcategory, causal_keywords, keywords, len(failures)
+        )
 
         # Generate suggestions
         prompt_fix = self._generate_prompt_fix(dominant_subcategory, failures)
@@ -875,12 +1014,23 @@ class FailureClusteringEngine:
             suggested_tool_fix=tool_fix,
         )
 
-    def _generate_cluster_label(self, subcategory: str | None, keywords: list[str], count: int) -> str:
+    def _generate_cluster_label(
+        self,
+        dominant_cause: str | None,
+        subcategory: str | None,
+        causal_keywords: list[str],
+        desc_keywords: list[str],
+        count: int
+    ) -> str:
         """Generate a human-readable label for the cluster."""
-        if subcategory and subcategory in FAILURE_DESCRIPTIONS:
+        if dominant_cause and dominant_cause in HUMAN_CAUSE_LABELS:
+            base = HUMAN_CAUSE_LABELS[dominant_cause]
+        elif subcategory and subcategory in FAILURE_DESCRIPTIONS:
             base = FAILURE_DESCRIPTIONS[subcategory]
-        elif keywords:
-            base = f"{keywords[0].title()} Issues"
+        elif causal_keywords:
+            base = f"{causal_keywords[0].title()} Causal Issues"
+        elif desc_keywords:
+            base = f"{desc_keywords[0].title()} Issues"
         else:
             base = "Unknown Failure Pattern"
 
@@ -910,7 +1060,6 @@ class FailureClusteringEngine:
 
     def _extract_keywords(self, text: str, top_n: int = 15) -> list[str]:
         """Extract important keywords from failure descriptions."""
-        # Simple TF-IDF based keyword extraction
         vectorizer = TfidfVectorizer(
             max_features=100,
             stop_words="english",
@@ -926,13 +1075,50 @@ class FailureClusteringEngine:
             return []
 
     def _tfidf_embed(self, texts: list[str]) -> list[list[float]]:
-        """Generate TF-IDF embeddings as fallback."""
-        vectorizer = TfidfVectorizer(max_features=128, stop_words="english")
+        """Generate TF-IDF embeddings as fallback, using weighted causal & surface features."""
+        if (
+            getattr(self, "_embedded_failures", None)
+            and len(self._embedded_failures) == len(texts)
+        ):
+            causal_texts = [item.causal_text for item in self._embedded_failures]
+            surface_texts = [item.surface_text for item in self._embedded_failures]
+        else:
+            causal_texts = []
+            surface_texts = []
+            for t in texts:
+                parts = t.split(" | ", 1)
+                if len(parts) == 2:
+                    causal_texts.append(parts[0])
+                    surface_texts.append(parts[1])
+                else:
+                    causal_texts.append(t)
+                    surface_texts.append("")
+
+        causal_vectorizer = TfidfVectorizer(max_features=128, stop_words="english")
+        surface_vectorizer = TfidfVectorizer(max_features=128, stop_words="english")
+
         try:
-            embeddings = vectorizer.fit_transform(texts).toarray()
-            return embeddings.tolist()
-        except Exception:
-            return [[0.0] * 128 for _ in texts]
+            try:
+                causal_matrix = causal_vectorizer.fit_transform(causal_texts).toarray()
+            except ValueError:
+                causal_matrix = np.zeros((len(causal_texts), 128))
+
+            try:
+                surface_matrix = surface_vectorizer.fit_transform(surface_texts).toarray()
+            except ValueError:
+                surface_matrix = np.zeros((len(surface_texts), 128))
+
+            # L2 normalize rows
+            causal_norms = np.linalg.norm(causal_matrix, axis=1, keepdims=True)
+            causal_matrix = np.divide(causal_matrix, causal_norms, out=np.zeros_like(causal_matrix), where=causal_norms > 0)
+
+            surface_norms = np.linalg.norm(surface_matrix, axis=1, keepdims=True)
+            surface_matrix = np.divide(surface_matrix, surface_norms, out=np.zeros_like(surface_matrix), where=surface_norms > 0)
+
+            combined = np.hstack([0.8 * causal_matrix, 0.2 * surface_matrix])
+            return combined.tolist()
+        except Exception as e:
+            raise RuntimeError(f"Clustering feature extraction failed: {e}") from e
 
     def compare_with_previous(
         self,
@@ -1207,7 +1393,10 @@ class FailureAnalysisPipeline:
         all_failures = []
 
         for trace in traces:
-            result = self.diagnoser.diagnose(trace)
+            result = self.diagnoser.diagnose(
+                trace,
+                task_description=str(trace.get("task_description") or trace.get("task_id") or ""),
+            )
             if isinstance(result, DiagnosedFailures):
                 all_failures.extend(result.failures)
             else:
