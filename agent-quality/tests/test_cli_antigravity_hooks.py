@@ -465,3 +465,26 @@ def test_antigravity_rows_from_jsonl_single_report(tmp_path):
     input_tokens, _, output_tokens = extract_usage(lines)
     assert input_tokens == 150
     assert output_tokens == 45
+
+
+def test_antigravity_rows_from_jsonl_preserves_generator_events_and_provenance():
+    lines = iter(
+        [
+            json.dumps(
+                {
+                    "type": "tool.completed",
+                    "status": "completed",
+                    "exit_code": 0,
+                    "command": "pytest",
+                }
+            )
+        ]
+    )
+
+    rows = rows_from_jsonl(lines, run_id="run_stream", session_id="ses_stream")
+
+    assert len(rows) == 1
+    assert rows[0]["source_provider"] == "google"
+    assert rows[0]["source_product"] == "antigravity"
+    assert rows[0]["source_event_type"] == "tool.completed"
+    assert rows[0]["exit_code"] == 0

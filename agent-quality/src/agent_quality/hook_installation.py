@@ -1,50 +1,31 @@
 from __future__ import annotations
 
-import copy
 import json
 import os
-import shlex
 import shutil
 import stat
 import subprocess
 import sys
 import tempfile
-import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, cast
+
+from agent_quality.adapters.provider_strategies import ProviderConfigError
+from agent_quality.adapters.registry import hook_adapter, hook_provider_names
 
 
-Provider = Literal["codex", "antigravity"]
-ProviderSelection = Literal["codex", "antigravity", "all"]
+Provider = str
+ProviderSelection = str
 
-PROVIDERS: tuple[Provider, ...] = ("codex", "antigravity")
-
-_CODEX_EVENTS = (
-    "SessionStart",
-    "UserPromptSubmit",
-    "PreToolUse",
-    "PostToolUse",
-    "PermissionRequest",
-    "Stop",
-)
-_ANTIGRAVITY_EVENTS = (
-    "PostToolUse",
-    "PreInvocation",
-    "PostInvocation",
-    "Stop",
-)
-_MATCHED_EVENTS = frozenset({"PreToolUse", "PostToolUse", "PermissionRequest"})
-_CODEX_MATCHER_EVENTS = frozenset({"SessionStart", *_MATCHED_EVENTS})
-_ANTIGRAVITY_MATCHER_EVENTS = frozenset({"PostToolUse"})
+PROVIDERS: tuple[Provider, ...] = hook_provider_names()
 _ANTIGRAVITY_NAMESPACE = "agent-quality"
 _PYTHON_PROBE_OUTPUT = "agent-quality-hook-runtime-ok"
 _IS_WINDOWS = os.name == "nt"
 
 
-class HookConfigError(ValueError):
-    """Raised when an existing hook configuration cannot be safely changed."""
+HookConfigError = ProviderConfigError
 
 
 @dataclass(frozen=True)
@@ -79,13 +60,7 @@ def hook_path(
 
     user_home = (home or Path.home()).expanduser().absolute()
     environment = os.environ if environ is None else environ
-    if provider == "codex":
-        configured_home = environment.get("CODEX_HOME")
-        codex_home = Path(configured_home).expanduser() if configured_home else user_home / ".codex"
-        return codex_home.absolute() / "hooks.json"
-    if provider == "antigravity":
-        return user_home / ".gemini" / "config" / "hooks.json"
-    raise ValueError(f"unsupported hook provider: {provider}")
+    return hook_adapter(provider).config_path(user_home, environment)
 
 
 def install_hooks(
@@ -117,9 +92,10 @@ def hooks_status(
     for selected in _providers(provider):
         path = hook_path(selected, home=home, environ=environ)
         data = _read_json_object(path)
-        installed = _provider_is_enabled(selected, path, data) and _is_installed(
-            selected,
+        adapter = hook_adapter(selected)
+        installed = adapter.is_enabled(path, data) and adapter.is_installed(
             data,
+            windows=_IS_WINDOWS,
         )
         results.append(HookResult(selected, path, installed))
     return results
@@ -173,67 +149,15 @@ def _absolute_python(python: str) -> Path:
 
 def _plan_install(provider: Provider, python: Path, path: Path) -> _WritePlan:
     original = _read_json_object(path)
-    if provider == "codex" and not _provider_is_enabled(provider, path, original):
-        raise HookConfigError(
-            f"Codex user hooks are disabled by {path.with_name('config.toml')}; "
-            "enable [features].hooks and set allow_managed_hooks_only=false before installing"
-        )
-    data = copy.deepcopy(original)
-    if provider == "codex":
-        hooks = data.setdefault("hooks", {})
-        if not isinstance(hooks, dict):
-            raise HookConfigError(f"expected 'hooks' to be an object in {path}")
-        for event, groups in list(hooks.items()):
-            if not isinstance(groups, list):
-                if event in _CODEX_EVENTS:
-                    raise HookConfigError(f"expected hooks.{event} to be an array in {path}")
-                continue
-            remaining = _without_agent_quality(groups, provider)
-            if remaining == groups:
-                continue
-            if remaining:
-                hooks[event] = remaining
-            else:
-                del hooks[event]
-        for event in _CODEX_EVENTS:
-            groups = hooks.get(event, [])
-            if not isinstance(groups, list):
-                raise HookConfigError(f"expected hooks.{event} to be an array in {path}")
-            hooks[event] = groups + [_hook_group(python, provider, event)]
-    else:
-        antigravity_hooks: dict[str, Any] = {"enabled": True}
-        for event in _ANTIGRAVITY_EVENTS:
-            if event in _ANTIGRAVITY_MATCHER_EVENTS:
-                antigravity_hooks[event] = [_hook_group(python, provider, event)]
-            else:
-                antigravity_hooks[event] = [_hook_handler(python, provider, event)]
-        data[_ANTIGRAVITY_NAMESPACE] = antigravity_hooks
-
+    adapter = hook_adapter(provider)
+    data = adapter.prepare_install(original, path, python, windows=_IS_WINDOWS)
     changed = data != original
     return _WritePlan(HookResult(provider, path, True, changed), data if changed else None)
 
 
 def _plan_uninstall(provider: Provider, path: Path) -> _WritePlan:
     original = _read_json_object(path)
-    data = copy.deepcopy(original)
-    if provider == "codex":
-        hooks = data.get("hooks")
-        if hooks is not None and not isinstance(hooks, dict):
-            raise HookConfigError(f"expected 'hooks' to be an object in {path}")
-        if isinstance(hooks, dict):
-            for event, groups in list(hooks.items()):
-                if not isinstance(groups, list):
-                    continue
-                remaining = _without_agent_quality(groups, provider)
-                if remaining == groups:
-                    continue
-                if remaining:
-                    hooks[event] = remaining
-                else:
-                    del hooks[event]
-    else:
-        data.pop(_ANTIGRAVITY_NAMESPACE, None)
-
+    data = hook_adapter(provider).prepare_uninstall(original, windows=_IS_WINDOWS)
     changed = data != original
     return _WritePlan(HookResult(provider, path, False, changed), data if changed else None)
 
@@ -268,238 +192,14 @@ def _apply(plans: list[_WritePlan]) -> list[HookResult]:
     return [plan.result for plan in plans]
 
 
-def _hook_group(python: Path, provider: Provider, event: str) -> dict[str, Any]:
-    group: dict[str, Any] = {"hooks": [_hook_handler(python, provider, event)]}
-    if event in _MATCHED_EVENTS:
-        group["matcher"] = "*"
-    return group
-
-
-def _hook_handler(python: Path, provider: Provider, event: str) -> dict[str, Any]:
-    hook: dict[str, Any] = {
-        "type": "command",
-        "command": _hook_command(python, provider, event),
-    }
-    if provider == "codex":
-        hook["commandWindows"] = _hook_command_windows(python, provider, event)
-    if event == "Stop":
-        hook["timeout"] = 30
-    return hook
-
-
 def _hook_command(python: Path, provider: Provider, event: str) -> str:
-    if provider == "antigravity" and _IS_WINDOWS:
-        return _hook_command_windows(python, provider, event)
-    return f"{shlex.quote(str(python))} -m agent_quality.cli hook {provider} {event}"
+    """Compatibility wrapper for tests and callers of the former helper."""
 
-
-def _hook_command_windows(python: Path, provider: Provider, event: str) -> str:
-    return subprocess.list2cmdline(
-        [str(python), "-m", "agent_quality.cli", "hook", provider, event]
-    )
-
-
-def _without_agent_quality(groups: list[Any], provider: Provider) -> list[Any]:
-    remaining_groups: list[Any] = []
-    for group in groups:
-        if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
-            remaining_groups.append(group)
-            continue
-
-        remaining_hooks = [
-            hook
-            for hook in group["hooks"]
-            if not _is_agent_quality_hook(hook, provider)
-        ]
-        if len(remaining_hooks) == len(group["hooks"]):
-            remaining_groups.append(group)
-            continue
-        if remaining_hooks:
-            preserved = copy.deepcopy(group)
-            preserved["hooks"] = remaining_hooks
-            remaining_groups.append(preserved)
-    return remaining_groups
-
-
-def _is_agent_quality_hook(hook: Any, provider: Provider, event: str | None = None) -> bool:
-    if not isinstance(hook, dict) or hook.get("type") != "command":
-        return False
-    command = hook.get("command")
-    if not isinstance(command, str):
-        return False
-    tokens = _split_hook_command(command, provider)
-    if tokens is None:
-        return False
-
-    expected = ["-m", "agent_quality.cli", "hook", provider]
-    for index in range(len(tokens) - len(expected) + 1):
-        if tokens[index : index + len(expected)] != expected:
-            continue
-        if event is None:
-            return True
-        event_index = index + len(expected)
-        return event_index < len(tokens) and tokens[event_index] == event
-    return False
-
-
-def _provider_is_enabled(provider: Provider, path: Path, data: dict[str, Any]) -> bool:
-    if provider == "antigravity":
-        hooks = data.get(_ANTIGRAVITY_NAMESPACE)
-        return not isinstance(hooks, dict) or hooks.get("enabled") is not False
-
-    config_path = path.with_name("config.toml")
-    if not config_path.exists():
-        return True
-    try:
-        config = tomllib.loads(config_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as exc:
-        raise HookConfigError(f"cannot read valid TOML from {config_path}: {exc}") from exc
-    if config.get("allow_managed_hooks_only") is True:
-        return False
-    features = config.get("features")
-    if not isinstance(features, dict):
-        return True
-    enabled = features.get("hooks", features.get("codex_hooks", True))
-    return enabled is not False
-
-
-def _is_installed(
-    provider: Provider,
-    data: dict[str, Any],
-) -> bool:
-    if provider == "codex":
-        hooks = data.get("hooks")
-        return isinstance(hooks, dict) and all(
-            _grouped_event_is_installed(
-                hooks.get(event),
-                provider,
-                event,
-            )
-            for event in _CODEX_EVENTS
-        )
-
-    hooks = data.get(_ANTIGRAVITY_NAMESPACE)
-    if (
-        not isinstance(hooks, dict)
-        or hooks.get("enabled") is False
-        or "PreToolUse" in hooks
-    ):
-        return False
-    return all(
-        (
-            _grouped_event_is_installed(
-                hooks.get(event),
-                provider,
-                event,
-            )
-            if event in _ANTIGRAVITY_MATCHER_EVENTS
-            else _direct_event_is_installed(
-                hooks.get(event),
-                provider,
-                event,
-            )
-        )
-        for event in _ANTIGRAVITY_EVENTS
-    )
-
-
-def _grouped_event_is_installed(
-    groups: Any,
-    provider: Provider,
-    event: str,
-) -> bool:
-    if not isinstance(groups, list):
-        return False
-    return any(
-        _is_runnable_agent_quality_hook(
-            hook,
-            provider,
-            event,
-        )
-        for group in groups
-        if (
-            isinstance(group, dict)
-            and isinstance(group.get("hooks"), list)
-            and _matcher_covers_all(provider, event, group.get("matcher"))
-        )
-        for hook in group["hooks"]
-    )
-
-
-def _direct_event_is_installed(
-    handlers: Any,
-    provider: Provider,
-    event: str,
-) -> bool:
-    return isinstance(handlers, list) and any(
-        _is_runnable_agent_quality_hook(
-            handler,
-            provider,
-            event,
-        )
-        for handler in handlers
-    )
-
-
-def _matcher_covers_all(provider: Provider, event: str, matcher: Any) -> bool:
-    matcher_events = _CODEX_MATCHER_EVENTS if provider == "codex" else _ANTIGRAVITY_MATCHER_EVENTS
-    return event not in matcher_events or matcher in (None, "", "*")
-
-
-def _is_runnable_agent_quality_hook(
-    hook: Any,
-    provider: Provider,
-    event: str,
-) -> bool:
-    python = _configured_python(hook, provider, event)
-    if python is None:
-        return False
-    # Status is deliberately structural and never executes a command parsed
-    # from provider-owned JSON. Installation performs the isolated import probe.
-    return python.is_absolute() and python.is_file() and os.access(python, os.X_OK)
-
-
-def _configured_python(hook: Any, provider: Provider, event: str) -> Path | None:
-    if not isinstance(hook, dict) or hook.get("type") != "command":
-        return None
-    command = hook.get("command")
-    if not isinstance(command, str):
-        return None
-    tokens = _split_hook_command(command, provider)
-    if tokens is None:
-        return None
-    expected_tail = ["-m", "agent_quality.cli", "hook", provider, event]
-    if len(tokens) != len(expected_tail) + 1 or tokens[1:] != expected_tail:
-        return None
-    python = Path(tokens[0])
-    if command != _hook_command(python, provider, event):
-        return None
-    if provider == "codex" and hook.get("commandWindows") != _hook_command_windows(
+    return hook_adapter(provider).render_command(
         python,
-        provider,
         event,
-    ):
-        return None
-    return python
-
-
-def _split_hook_command(command: str, provider: Provider) -> list[str] | None:
-    """Split the command using the quoting dialect used when it was generated."""
-
-    windows_command = provider == "antigravity" and _IS_WINDOWS
-    try:
-        tokens = shlex.split(command, posix=not windows_command)
-    except ValueError:
-        return None
-    if windows_command:
-        tokens = [_strip_windows_quotes(token) for token in tokens]
-    return tokens
-
-
-def _strip_windows_quotes(token: str) -> str:
-    if len(token) >= 2 and token.startswith('"') and token.endswith('"'):
-        return token[1:-1]
-    return token
+        windows=_IS_WINDOWS,
+    )
 
 
 def _python_can_import_agent_quality(python: Path) -> bool:

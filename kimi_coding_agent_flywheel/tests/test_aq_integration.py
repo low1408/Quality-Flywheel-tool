@@ -234,7 +234,8 @@ def test_save_clusters_transactional_atomicity(tmp_path):
 
 def test_package_boundary_rules():
     # Scan agent-quality/src for any reference to kimi_coding_agent_flywheel
-    src_dir = Path("agent-quality/src")
+    repository_root = Path(__file__).resolve().parents[2]
+    src_dir = repository_root / "agent-quality" / "src"
     assert src_dir.exists()
     
     violations = []

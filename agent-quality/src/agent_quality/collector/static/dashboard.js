@@ -2,7 +2,7 @@
   "use strict";
 
   const vscode = typeof acquireVsCodeApi === "function" ? acquireVsCodeApi() : null;
-  const initialRunId = window.__AGENT_QUALITY_INITIAL_RUN_ID__ || null;
+  const initialRunId = null;
   const tabs = [
     ["overview", "Overview"],
     ["verifiers", "Verifiers"],
@@ -83,6 +83,9 @@
     document.addEventListener("input", handleInput);
     document.addEventListener("change", handleChange);
     window.addEventListener("message", handleHostMessage);
+    if (vscode) {
+      vscode.postMessage({ command: "ready" });
+    }
     initSidebarResize();
     loadRuns();
   }
@@ -231,6 +234,10 @@
       copyTranscript("compact");
     } else if (action === "copyNoToolsTranscript") {
       copyTranscript("no-tools");
+    } else if (action === "copyJudgeTranscript") {
+      copyTranscript("judge");
+    } else if (action === "copyJudgeNoToolsTranscript") {
+      copyTranscript("judge-no-tools");
     } else if (action === "closeModal") {
       closeModal();
     }
@@ -497,8 +504,9 @@
           <div class="detail-actions">
             ${deleteChatButton}
             <button type="button" class="button ghost" data-action="copyTranscript">Copy Chat</button>
-            <button type="button" class="button ghost" data-action="copyCompactTranscript">Copy Compact</button>
             <button type="button" class="button ghost" data-action="copyNoToolsTranscript">Copy No Tools</button>
+            <button type="button" class="button ghost" data-action="copyJudgeTranscript">Copy for Judge</button>
+            <button type="button" class="button ghost" data-action="copyJudgeNoToolsTranscript">Copy for Judge (No Tools)</button>
             <button type="button" class="button ghost" data-action="openDiff">Open Diff</button>
             <button type="button" class="button primary" data-action="setTab" data-tab="review">Review</button>
           </div>
@@ -941,13 +949,48 @@
       return;
     }
     const isCompact = mode === "compact";
-    const excludesTools = mode === "no-tools";
-    const text = buildTranscriptMarkdown(state.details, {
+    const excludesTools = mode === "no-tools" || mode === "judge-no-tools";
+    const rawTranscript = buildTranscriptMarkdown(state.details, {
       compact: isCompact,
       includeTools: !excludesTools,
       textLimit: isCompact ? 6000 : 60000,
       toolLimit: isCompact ? 2500 : 12000
     });
+
+    let text = rawTranscript;
+    if (mode === "judge" || mode === "judge-no-tools") {
+      const systemPrompt = `You are an expert AI systems debugger.
+
+Analyze the following agent execution trace and identify ALL failures.
+
+For each failure, provide:
+1. Subcategory (choose from: skipping_validation, code_syntax_error, API_error, model_limitation, prompt_issue, tool_issue, other)
+2. Severity (low/medium/high/critical)
+3. A 2-3 sentence diagnostic description
+4. The likely root cause
+5. A specific suggestion for fixing it
+6. The affected prompt component (e.g. system_prompt, user_prompt, etc. or null)
+
+Format your response as a valid JSON object matching this schema:
+{
+  "overall_score": float,
+  "failures": [
+    {
+      "subcategory": "string",
+      "severity": "low|medium|high|critical",
+      "description": "string",
+      "root_cause": "string",
+      "suggested_fix": "string",
+      "affected_prompt_component": "string"
+    }
+  ],
+  "summary": "string"
+}
+
+Here is the trace:
+`;
+      text = systemPrompt + "\n" + rawTranscript;
+    }
     setSync("Copying");
     try {
       if (vscode) {
@@ -977,6 +1020,12 @@
     if (mode === "no-tools") {
       return "chat transcript without tool executions";
     }
+    if (mode === "judge") {
+      return "judge prompt with chat transcript";
+    }
+    if (mode === "judge-no-tools") {
+      return "judge prompt with chat transcript (no tools)";
+    }
     return "chat transcript";
   }
 
@@ -986,6 +1035,12 @@
     }
     if (mode === "no-tools") {
       return "Chat Transcript Without Tool Executions";
+    }
+    if (mode === "judge") {
+      return "LLM Judge Prompt";
+    }
+    if (mode === "judge-no-tools") {
+      return "LLM Judge Prompt (No Tools)";
     }
     return "Chat Transcript";
   }

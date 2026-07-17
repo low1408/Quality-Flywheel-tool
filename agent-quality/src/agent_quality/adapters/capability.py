@@ -1,12 +1,13 @@
-from __future__ import annotations
+"""Compatibility exports for centralized adapter capabilities."""
 
-CODEX_CLI_CAPABILITIES = {
-    "prompt_submitted": True,
-    "assistant_output": True,
-    "reasoning_summaries": True,
-    "tool_started": True,
-    "tool_completed": True,
-    "file_mutations": True,
-    "artifact_events": False,
-    "token_usage": True,
-}
+from agent_quality.adapters.registry import (
+    ANTIGRAVITY_CAPABILITIES,
+    CODEX_CLI_CAPABILITIES,
+    STREAM_CAPABILITIES,
+)
+
+__all__ = [
+    "ANTIGRAVITY_CAPABILITIES",
+    "CODEX_CLI_CAPABILITIES",
+    "STREAM_CAPABILITIES",
+]

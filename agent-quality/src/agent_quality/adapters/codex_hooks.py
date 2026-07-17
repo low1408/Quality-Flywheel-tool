@@ -532,6 +532,27 @@ def _artifacts(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return artifacts
 
 
+def assistant_output(event_name: str, payload: dict[str, Any]) -> str | None:
+    """Return displayable assistant output from a Codex hook payload."""
+
+    return _assistant_output(event_name, payload)
+
+
+def file_links(
+    payload: dict[str, Any],
+    assistant_output: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return file links exposed by a Codex hook payload."""
+
+    return _file_links(payload, assistant_output)
+
+
+def artifacts(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return artifacts exposed by a Codex hook payload."""
+
+    return _artifacts(payload)
+
+
 def _first_path(*groups: list[dict[str, Any]]) -> str | None:
     for group in groups:
         for item in group:

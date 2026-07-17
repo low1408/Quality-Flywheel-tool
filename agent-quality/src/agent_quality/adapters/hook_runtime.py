@@ -5,8 +5,10 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlparse
 
+from agent_quality.adapters.provider_strategies import resolve_directory
+from agent_quality.adapters.registry import hook_adapter
+from agent_quality.capture.git_state import discover_repo_root
 from agent_quality.ids import new_id
 from agent_quality.privacy.redaction import redact_json, redact_text
 
@@ -40,10 +42,10 @@ def resolve_hook_runtime(
 
     try:
         current_directory = Path.cwd()
-        process_cwd = _resolved_directory(cwd or current_directory, base=current_directory)
+        process_cwd = resolve_directory(cwd or current_directory, base=current_directory)
     except (OSError, RuntimeError):
         return None
-    candidates = _candidate_directories(provider, payload, process_cwd)
+    candidates = hook_adapter(provider).candidate_directories(payload, process_cwd)
     return next(
         (
             runtime
@@ -126,86 +128,6 @@ def spool_hook_failure(
         return None
 
 
-def _candidate_directories(provider: str, payload: dict[str, Any], process_cwd: Path) -> list[Path]:
-    raw_candidates: list[Any] = []
-    if provider == "codex":
-        raw_candidates.extend(_payload_values(payload, "cwd"))
-    elif provider == "antigravity":
-        for value in _payload_values(payload, "workspacePaths", "workspace_paths"):
-            raw_candidates.extend(value if isinstance(value, list) else [value])
-
-    if not raw_candidates:
-        raw_candidates.append(process_cwd)
-    directories: list[Path] = []
-    seen: set[Path] = set()
-    for value in raw_candidates:
-        path_value = _workspace_path(value)
-        if path_value is None:
-            continue
-        directory = _resolved_directory(path_value, base=process_cwd)
-        if directory not in seen:
-            directories.append(directory)
-            seen.add(directory)
-    if provider == "antigravity" and directories:
-        tool_cwd = _antigravity_tool_cwd(payload, process_cwd)
-        preferred_locations = [location for location in (tool_cwd, process_cwd) if location]
-        ordered: list[Path] = []
-        for location in preferred_locations:
-            if location not in ordered:
-                ordered.append(location)
-            ordered.extend(
-                directory
-                for directory in directories
-                if directory not in ordered and _contains(directory, location)
-            )
-        directories = ordered + [directory for directory in directories if directory not in ordered]
-    return directories or [process_cwd]
-
-
-def _payload_values(payload: dict[str, Any], *keys: str) -> list[Any]:
-    direct = [payload[key] for key in keys if key in payload]
-    if direct:
-        return direct
-
-    found: list[Any] = []
-    for value in payload.values():
-        if isinstance(value, dict):
-            found.extend(_payload_values(value, *keys))
-        elif isinstance(value, list):
-            for item in value:
-                if isinstance(item, dict):
-                    found.extend(_payload_values(item, *keys))
-    return found
-
-
-def _workspace_path(value: Any) -> str | Path | None:
-    if isinstance(value, Path):
-        return value
-    if isinstance(value, str) and value:
-        if value.startswith("file://"):
-            parsed = urlparse(value)
-            return unquote(parsed.path)
-        return value
-    if isinstance(value, dict):
-        for key in ("path", "uri", "root"):
-            candidate = value.get(key)
-            if isinstance(candidate, str) and candidate:
-                return _workspace_path(candidate)
-    return None
-
-
-def _resolved_path(value: Path | str, *, base: Path) -> Path:
-    path = Path(value).expanduser()
-    if not path.is_absolute():
-        path = base / path
-    return path.resolve()
-
-
-def _resolved_directory(value: Path | str, *, base: Path) -> Path:
-    path = _resolved_path(value, base=base)
-    return path.parent if path.is_file() else path
-
-
 def _initialized_runtime(candidate: Path) -> HookRuntime | None:
     repository_path = _repository_root(candidate)
     agent_quality_dir = repository_path / ".agent-quality"
@@ -278,8 +200,6 @@ def _runtime_is_safe(runtime: HookRuntime, *, check_consent: bool = True) -> boo
 
 
 def _git_reports_tracked(repository: Path, marker: Path) -> bool:
-    if not (repository / ".git").exists():
-        return False
     try:
         relative_marker = marker.relative_to(repository)
         result = subprocess.run(
@@ -298,23 +218,6 @@ def _sqlite_sidecar_paths(db_path: Path) -> tuple[Path, ...]:
     return tuple(db_path.with_name(f"{db_path.name}{suffix}") for suffix in SQLITE_SIDECAR_SUFFIXES)
 
 
-def _antigravity_tool_cwd(payload: dict[str, Any], process_cwd: Path) -> Path | None:
-    tool_call = payload.get("toolCall") or payload.get("tool_call")
-    if not isinstance(tool_call, dict):
-        return None
-    arguments = tool_call.get("args") or tool_call.get("arguments")
-    if not isinstance(arguments, dict):
-        return None
-    value = arguments.get("Cwd") or arguments.get("cwd")
-    path_value = _workspace_path(value)
-    if path_value is None:
-        return None
-    try:
-        return _resolved_directory(path_value, base=process_cwd)
-    except (OSError, RuntimeError):
-        return None
-
-
 def _contains(parent: Path, child: Path) -> bool:
     try:
         child.relative_to(parent)
@@ -324,9 +227,9 @@ def _contains(parent: Path, child: Path) -> bool:
 
 
 def _repository_root(candidate: Path) -> Path:
-    for ancestor in (candidate, *candidate.parents):
-        if (ancestor / ".git").exists():
-            return ancestor.resolve()
+    git_root = discover_repo_root(candidate)
+    if git_root is not None:
+        return git_root
     for ancestor in (candidate, *candidate.parents):
         if (ancestor / ".agent-quality" / "config.yaml").is_file():
             return ancestor.resolve()

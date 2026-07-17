@@ -6,7 +6,7 @@ This extension provides a thin VS Code interface over the `aq` CLI.
 
 ## Features
 
-- Initialize `.agent-quality` in the current workspace.
+- Initialize `.agent-quality` at the current Git repository root.
 - Run a measured Codex task from an input prompt or selected editor text.
 - Install and inspect user-level Codex and Antigravity hooks.
 - Start and stop the local loopback collector.
@@ -23,7 +23,10 @@ aq hooks install --provider all
 
 The command works without an open workspace and manages hooks in `$CODEX_HOME/hooks.json` (normally `~/.codex/hooks.json`) and `~/.gemini/config/hooks.json`. To trust the Codex definitions, open an integrated terminal, run the interactive `codex` CLI, then use `/hooks`. Start a new IDE chat after trusting them. **Agent Quality: Show User Hook Status** runs `aq hooks status --provider all` but cannot verify Codex's trust decision.
 
-Existing extension installations already expose **Agent Quality: Open Dashboard**. Update to extension version 0.1.14 or later only to use the new user-hook install and status commands; the same setup is always available through the `aq hooks` CLI.
+Extension 0.1.15 requires Agent Quality 0.2.0 or later. It uses the CLI's
+versioned, allowlisted `ui-api` contract for dashboard data and keeps database
+access in the Python collector package. The same hook setup remains available
+through the `aq hooks` CLI.
 
 Each repository opts in separately. Open it and run **Agent Quality: Initialize Project**, or use:
 
@@ -52,13 +55,23 @@ python3 -m pip install -e ..
 
 Then open this folder in VS Code and run the extension host.
 
+The browser dashboard assets under `agent_quality/collector/static` are the
+single source of truth. Generate the extension's ignored packaging copies and
+check every JavaScript module before launching or packaging:
+
+```bash
+npm run check
+```
+
+`vscode:prepublish` also performs this synchronization automatically.
+
 By default, extension commands set `AGENT_QUALITY_HOME` to:
 
 ```text
-<workspace>/.agent-quality/local
+<git-repository-root>/.agent-quality/local
 ```
 
-This project-local setting applies to run, collector, report, and dashboard operations. User hook install and status commands intentionally do not set it, and globally installed provider hooks ignore `AGENT_QUALITY_HOME` so it cannot bypass per-project initialization.
+This repository-local setting applies to run, collector, report, and dashboard operations. User hook install and status commands intentionally do not set it, and globally installed provider hooks ignore `AGENT_QUALITY_HOME` so it cannot bypass per-project initialization.
 
 Override `agentQuality.aqCommand` if `aq` is not on `PATH`.
 
@@ -67,7 +80,7 @@ If commands do not run from VS Code but `aq` works in your terminal, set:
 ```json
 {
   "agentQuality.aqCommand": "python3 -m agent_quality.cli",
-  "agentQuality.cliSourceRoot": "/home/harry/Documents/Github-Projects/personal-projects/quality-flywheel/agent-quality"
+  "agentQuality.cliSourceRoot": "/path/to/quality-flywheel/agent-quality"
 }
 ```
 

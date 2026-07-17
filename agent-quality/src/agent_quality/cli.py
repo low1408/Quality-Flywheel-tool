@@ -6,15 +6,21 @@ import sqlite3
 import sys
 from pathlib import Path
 
-from agent_quality.adapters.antigravity import main as antigravity_hook_main
-from agent_quality.adapters.codex_hooks import main as codex_hook_main
+from agent_quality import __version__
 from agent_quality.adapters.hook_runtime import (
     CONSENT_MARKER_NAME,
     initialize_project_consent,
     validate_project_consent_location,
 )
+from agent_quality.adapters.registry import (
+    dispatch_hook,
+    hook_adapter,
+    hook_provider_names,
+)
+from agent_quality.capture.git_state import discover_repo_root
 from agent_quality.collector.envelope import normalize_envelope
 from agent_quality.collector.server import serve
+from agent_quality.collector.ui_api import UI_ACTIONS, run_ui_api
 from agent_quality.db import all_rows, connect, insert, one
 from agent_quality.hook_installation import (
     HookConfigError,
@@ -31,6 +37,7 @@ from agent_quality.review.service import review_run
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="aq")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
     init = sub.add_parser("init")
@@ -52,25 +59,29 @@ def main(argv: list[str] | None = None) -> None:
 
     hook = sub.add_parser("hook")
     hook_sub = hook.add_subparsers(dest="hook", required=True)
-    codex_hook = hook_sub.add_parser("codex")
-    codex_hook.add_argument("event")
-    antigravity_hook = hook_sub.add_parser("antigravity")
-    antigravity_hook.add_argument("event")
+    hook_providers = hook_provider_names()
+    for provider in hook_providers:
+        provider_hook = hook_sub.add_parser(provider)
+        provider_hook.add_argument("event")
 
     hooks = sub.add_parser("hooks")
     hooks_sub = hooks.add_subparsers(dest="hooks_command", required=True)
+    provider_choices = (*hook_providers, "all")
     hooks_install = hooks_sub.add_parser("install")
-    hooks_install.add_argument("--provider", choices=("codex", "antigravity", "all"), default="all")
+    hooks_install.add_argument("--provider", choices=provider_choices, default="all")
     hooks_install.add_argument("--python", default=sys.executable)
     hooks_status_parser = hooks_sub.add_parser("status")
-    hooks_status_parser.add_argument("--provider", choices=("codex", "antigravity", "all"), default="all")
+    hooks_status_parser.add_argument("--provider", choices=provider_choices, default="all")
     hooks_uninstall = hooks_sub.add_parser("uninstall")
-    hooks_uninstall.add_argument("--provider", choices=("codex", "antigravity", "all"), default="all")
+    hooks_uninstall.add_argument("--provider", choices=provider_choices, default="all")
 
     server = sub.add_parser("serve-collector")
     server.add_argument("--host", default="127.0.0.1")
     server.add_argument("--port", type=int, default=8765)
     server.add_argument("--token")
+
+    ui_api = sub.add_parser("ui-api")
+    ui_api.add_argument("action", choices=UI_ACTIONS)
 
     review = sub.add_parser("review")
     review.add_argument("run_id", nargs="?")
@@ -109,14 +120,17 @@ def main(argv: list[str] | None = None) -> None:
         )
     elif args.command == "ingest":
         _ingest(args.file)
-    elif args.command == "hook" and args.hook == "codex":
-        raise SystemExit(codex_hook_main([args.event]))
-    elif args.command == "hook" and args.hook == "antigravity":
-        raise SystemExit(antigravity_hook_main([args.event]))
+    elif args.command == "hook":
+        raise SystemExit(dispatch_hook(args.hook, args.event))
     elif args.command == "hooks":
         _run_hooks_command(args)
     elif args.command == "serve-collector":
         serve(args.host, args.port, token=args.token)
+    elif args.command == "ui-api":
+        try:
+            run_ui_api(args.action, sys.stdin, sys.stdout)
+        except (FileNotFoundError, KeyError, PermissionError, ValueError) as exc:
+            raise SystemExit(f"error: {exc}") from exc
     elif args.command == "review":
         review_run(args.run_id)
     elif args.command == "show":
@@ -197,13 +211,13 @@ def _run_hooks_command(args: argparse.Namespace) -> None:
             for result in results:
                 state = "installed" if result.changed else "already installed"
                 print(f"{result.provider}: {state} ({result.path})")
-            _print_codex_trust_note(results)
+            _print_hook_trust_notes(results)
         elif args.hooks_command == "status":
             results = hooks_status(args.provider)
             for result in results:
                 state = "configured" if result.installed else "not configured"
                 print(f"{result.provider}: {state} ({result.path})")
-            _print_codex_trust_note(results)
+            _print_hook_trust_notes(results)
         elif args.hooks_command == "uninstall":
             results = uninstall_hooks(args.provider)
             for result in results:
@@ -213,26 +227,19 @@ def _run_hooks_command(args: argparse.Namespace) -> None:
         raise SystemExit(f"error: {exc}") from exc
 
 
-def _print_codex_trust_note(results: list[HookResult]) -> None:
+def _print_hook_trust_notes(results: list[HookResult]) -> None:
     for result in results:
-        if result.provider != "codex" or not result.installed:
+        if not result.installed:
             continue
-        print(
-            "codex: trust is not verified by aq; in a terminal, cd to the repository "
-            f"and open the interactive Codex CLI (not IDE chat), then use /hooks to "
-            f"trust {result.path}; afterward start a new IDE chat"
-        )
-        return
+        note = hook_adapter(result.provider).trust_note(result.path)
+        if note:
+            print(note)
 
 
 def _project_root(repo: Path) -> Path:
     path = repo.expanduser().resolve()
-    if path.is_file():
-        path = path.parent
-    for candidate in (path, *path.parents):
-        if (candidate / ".git").exists():
-            return candidate
-    return path
+    fallback = path.parent if path.is_file() else path
+    return discover_repo_root(path) or fallback
 
 
 def _ingest(path: str | None) -> None:

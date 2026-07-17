@@ -1,13 +1,37 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-quality"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local-first quality telemetry and verification sidecar for coding agents."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
+authors = [
+  { name = "Quality Flywheel contributors" },
+]
+keywords = ["agent-evaluation", "observability", "telemetry", "verification"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development :: Quality Assurance",
+]
 dependencies = ["PyYAML>=6"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.urls]
+Homepage = "https://github.com/low1408/Quality-Flywheel-tool"
+Repository = "https://github.com/low1408/Quality-Flywheel-tool.git"
+Issues = "https://github.com/low1408/Quality-Flywheel-tool/issues"
 
 [project.scripts]
 aq = "agent_quality.cli:main"

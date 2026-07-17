@@ -326,14 +326,16 @@ def test_status_detects_a_deleted_python_environment(tmp_path):
     assert not hooks_status("codex", home=tmp_path, environ={})[0].installed
 
 
-def test_status_detects_an_environment_that_can_no_longer_import_the_package(tmp_path):
+def test_status_does_not_execute_a_configured_provider_command(tmp_path):
     python = _python_wrapper(tmp_path / "broken-environment" / "python")
     install_hooks("codex", str(python), home=tmp_path, environ={})
     assert hooks_status("codex", home=tmp_path, environ={})[0].installed
 
     python.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
 
-    assert not hooks_status("codex", home=tmp_path, environ={})[0].installed
+    # Status validates the managed command structurally. It deliberately does
+    # not execute a Python path read from provider-owned configuration.
+    assert hooks_status("codex", home=tmp_path, environ={})[0].installed
 
 
 def test_install_rejects_an_executable_that_cannot_import_agent_quality(tmp_path):
@@ -438,7 +440,7 @@ def test_cli_defaults_to_all_providers_and_legacy_commands_are_removed(
     assert "codex: installed" in output
     assert "antigravity: installed" in output
     assert "codex: trust is not verified by aq" in output
-    assert "in a terminal, cd to the repository and run codex" in output
+    assert "open the interactive Codex CLI (not IDE chat)" in output
     assert "use /hooks to trust" in output
     assert "afterward start a new IDE chat" in output
     assert str(tmp_path / ".codex" / "hooks.json") in output
@@ -453,7 +455,7 @@ def test_cli_defaults_to_all_providers_and_legacy_commands_are_removed(
 
     main(["hooks", "status", "--provider", "codex"])
     status_output = capsys.readouterr().out
-    assert "codex: installed" in status_output
+    assert "codex: configured" in status_output
     assert "codex: trust is not verified by aq" in status_output
 
 

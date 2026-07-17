@@ -2,7 +2,7 @@
   "name": "agent-quality-vscode",
   "displayName": "Agent Quality",
   "description": "VS Code commands and views for the Agent Quality local sidecar.",
-  "version": "0.1.14",
+  "version": "0.1.15",
   "publisher": "agent-quality",
   "license": "MIT",
   "repository": {
@@ -10,7 +10,10 @@
     "url": "https://github.com/low1408/Quality-Flywheel-tool.git"
   },
   "scripts": {
-    "check": "node --check src/extension.js",
+    "sync-dashboard-assets": "node scripts/sync-dashboard-assets.js",
+    "check-dashboard-assets": "node scripts/sync-dashboard-assets.js --check",
+    "check": "npm run sync-dashboard-assets && node --check src/extension.js && node --check src/runtime.js && node --check src/commands.js && node --check src/runs-tree.js && node --check src/webview.js && node --check src/dashboard-panel.js && node --check src/flywheel-panel.js && node --check media/dashboard.js && node --check media/flywheel.js && npm run check-dashboard-assets",
+    "vscode:prepublish": "npm run sync-dashboard-assets && npm run check",
     "validate-package": "node -e \"JSON.parse(require('fs').readFileSync('package.json', 'utf8'))\""
   },
   "engines": {
@@ -194,12 +197,12 @@
         "agentQuality.home": {
           "type": "string",
           "default": "",
-          "description": "AGENT_QUALITY_HOME for VS Code commands. Defaults to .agent-quality/local in the workspace."
+          "description": "AGENT_QUALITY_HOME for VS Code commands. Defaults to .agent-quality/local at the Git repository root."
         },
         "agentQuality.verifyPath": {
           "type": "string",
           "default": "",
-          "description": "Verifier config path. Defaults to .agent-quality/verify.yaml in the workspace when it exists."
+          "description": "Verifier config path. Defaults to .agent-quality/verify.yaml at the Git repository root when it exists."
         },
         "agentQuality.allowDirtyRuns": {
           "type": "boolean",

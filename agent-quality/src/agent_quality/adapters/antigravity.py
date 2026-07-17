@@ -14,23 +14,13 @@ from agent_quality.adapters.hook_runtime import (
     resolve_hook_runtime,
     spool_hook_failure,
 )
+from agent_quality.adapters.registry import ANTIGRAVITY_CAPABILITIES
 from agent_quality.collector.envelope import make_envelope, normalize_envelope
 from agent_quality.db import connect, insert
 from agent_quality.hashutil import sha256_text
 from agent_quality.ids import new_id
 from agent_quality.privacy.redaction import POLICY_VERSION, redact_json
 from agent_quality.timeutil import utc_now
-
-ANTIGRAVITY_CAPABILITIES = {
-    "prompt_submitted": True,
-    "assistant_output": True,
-    "reasoning_summaries": True,
-    "tool_started": True,
-    "tool_completed": True,
-    "file_mutations": True,
-    "artifact_events": False,
-    "token_usage": True,
-}
 
 MARKDOWN_FILE_LINK_RE = re.compile(r"\[[^\]]+\]\((/[^)\n]+?)(?::(\d+))?\)")
 
@@ -317,33 +307,39 @@ def _hook_idempotency_key(
 
 def rows_from_jsonl(lines: Iterable[str], *, run_id: str, session_id: str | None = None) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
+    buffered_lines = list(lines)
     # If the output is a single JSON object (representing the complete structured report), parse it directly
-    text_buffer = "".join(lines).strip()
+    text_buffer = "".join(buffered_lines).strip()
     if text_buffer.startswith("{") and text_buffer.endswith("}"):
         try:
             raw = json.loads(text_buffer)
-            # If it's a full run summary, map it to a stop/summary event
-            raw_redacted = redact_json(raw).value
-            envelope = make_envelope(
-                event_type="agent.message",
-                source_event_type="RunSummary",
-                data={
-                    "status": "completed" if raw_redacted.get("exit_code") in (0, None) else "failed",
-                    "item_type": "assistant_output",
-                    "assistant_output": raw_redacted.get("output") or raw_redacted.get("response") or "",
-                },
-                run_id=run_id,
-                session_id=session_id,
-                sequence=1,
-                extensions={"google.antigravity": raw_redacted},
-            )
-            rows.append(normalize_envelope(envelope))
-            return rows
+            if isinstance(raw, dict) and ("output" in raw or "response" in raw):
+                # A complete report has an assistant response. A one-line tool
+                # event is still an event and must continue through JSONL parsing.
+                raw_redacted = redact_json(raw).value
+                envelope = make_envelope(
+                    event_type="agent.message",
+                    source_event_type="RunSummary",
+                    source_provider="google",
+                    source_product="antigravity",
+                    adapter_version="antigravity-cli-0.1.0",
+                    data={
+                        "status": "completed" if raw_redacted.get("exit_code") in (0, None) else "failed",
+                        "item_type": "assistant_output",
+                        "assistant_output": raw_redacted.get("output") or raw_redacted.get("response") or "",
+                    },
+                    run_id=run_id,
+                    session_id=session_id,
+                    sequence=1,
+                    extensions={"google.antigravity": raw_redacted},
+                )
+                rows.append(normalize_envelope(envelope))
+                return rows
         except json.JSONDecodeError:
             pass
 
     # Fallback: parse JSON lines if it outputs events step by step
-    for sequence, line in enumerate(lines, start=1):
+    for sequence, line in enumerate(buffered_lines, start=1):
         stripped = line.strip()
         if not stripped:
             continue
@@ -365,6 +361,9 @@ def rows_from_jsonl(lines: Iterable[str], *, run_id: str, session_id: str | None
         envelope = make_envelope(
             event_type="agent.tool.completed" if exit_code is not None else "agent.event",
             source_event_type=kind,
+            source_provider="google",
+            source_product="antigravity",
+            adapter_version="antigravity-cli-0.1.0",
             data={
                 "status": status,
                 "command": command,
@@ -562,6 +561,27 @@ def _artifacts(payload: dict[str, Any]) -> list[dict[str, Any]]:
         if isinstance(value, str):
             add(_strip_line_suffix(value), "hook_artifact")
     return artifacts
+
+
+def assistant_output(event_name: str, payload: dict[str, Any]) -> str | None:
+    """Return displayable assistant output from an Antigravity hook payload."""
+
+    return _assistant_output(event_name, payload)
+
+
+def file_links(
+    payload: dict[str, Any],
+    assistant_output: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return file links exposed by an Antigravity hook payload."""
+
+    return _file_links(payload, assistant_output)
+
+
+def artifacts(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return artifacts exposed by an Antigravity hook payload."""
+
+    return _artifacts(payload)
 
 
 def _first_path(*groups: list[dict[str, Any]]) -> str | None:

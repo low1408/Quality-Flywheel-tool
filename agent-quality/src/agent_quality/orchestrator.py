@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 import time
 from pathlib import Path
 
 from agent_quality import __version__
+from agent_quality.adapters.registry import select_agent_adapter
 from agent_quality.capture.artifacts import write_artifact
 from agent_quality.capture.git_state import diff, file_hash_if_exists, head_commit, repo_root, status_porcelain
 from agent_quality.config import load_verify_config
@@ -46,20 +46,9 @@ def run_task(
     prompt_hash = sha256_text(prompt)
     begin = time.monotonic()
 
-    # Determine command
-    command = agent_command
-    if not command:
-        command = ["codex", "exec", "--json", "--sandbox", "workspace-write", prompt]
-        if model:
-            command = ["codex", "exec", "--json", "--model", model, "--sandbox", "workspace-write", prompt]
-    elif len(command) == 1:
-        executable = Path(command[0]).name
-        if executable == "agy":
-            command = [command[0], "-p", "--output-format", "json", "--dangerously-skip-permissions", prompt]
-        elif executable == "antigravity":
-            command = [command[0], "chat", prompt]
-
-    agent_adapter = _agent_adapter(command)
+    adapter_selection = select_agent_adapter(agent_command, prompt=prompt, model=model)
+    command = adapter_selection.command
+    agent_adapter = adapter_selection.reported_name
     agent_status = "created"
     verifier_status = None
     run_inserted = False
@@ -93,7 +82,7 @@ def run_task(
                     "resulting_commit": None,
                     "model": model,
                     "agent_adapter": agent_adapter,
-                    "agent_version": _agent_version(agent_adapter),
+                    "agent_version": adapter_selection.version(),
                     "wrapper_version": __version__,
                     "codex_config_hash": file_hash_if_exists(repo, ".codex/config.toml"),
                     "agents_md_hash": file_hash_if_exists(repo, "AGENTS.md"),
@@ -151,19 +140,11 @@ def run_task(
             agent_status = "failed"
 
         raw_lines = stdout.splitlines()
-        
-        # Dynamically dispatch adapter parsing functions based on agent_adapter
-        import agent_quality.adapters.codex_cli as codex_cli
-        import agent_quality.adapters.antigravity as antigravity_cli
-
-        if agent_adapter in ("antigravity", "agy"):
-            adapter_rows_from_jsonl = antigravity_cli.rows_from_jsonl
-            adapter_extract_usage = antigravity_cli.extract_usage
-        else:
-            adapter_rows_from_jsonl = codex_cli.rows_from_jsonl
-            adapter_extract_usage = codex_cli.extract_usage
-
-        rows = adapter_rows_from_jsonl(raw_lines, run_id=run_id, session_id=session_id)
+        rows = adapter_selection.adapter.rows_from_jsonl(
+            raw_lines,
+            run_id=run_id,
+            session_id=session_id,
+        )
         with conn:
             for row in rows:
                 insert(conn, "events", row)
@@ -202,7 +183,7 @@ def run_task(
                     },
                 )
 
-        input_tokens, cached_input_tokens, output_tokens = adapter_extract_usage(raw_lines)
+        input_tokens, cached_input_tokens, output_tokens = adapter_selection.adapter.extract_usage(raw_lines)
         duration_ms = int((time.monotonic() - begin) * 1000)
         with conn:
             update_run(
@@ -257,23 +238,6 @@ def _store_artifact(conn: Any, run_id: str, artifact_type: str, name: str, conte
             "size_bytes": size,
         },
     )
-
-
-def _agent_version(agent_adapter: str) -> str | None:
-    executable = agent_adapter
-    if executable == "codex-cli":
-        executable = "codex"
-    if not shutil.which(executable):
-        return None
-    proc = subprocess.run([executable, "--version"], text=True, capture_output=True)
-    return (proc.stdout or proc.stderr).strip() or None
-
-
-def _agent_adapter(command: list[str]) -> str:
-    if not command:
-        return "unknown"
-    executable = Path(command[0]).name
-    return "codex-cli" if executable == "codex" else executable
 
 
 def _output_text(value: str | bytes | None) -> str:

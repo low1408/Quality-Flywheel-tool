@@ -1,25 +1,77 @@
 import json
 from pathlib import Path
-import subprocess
-import sys
 
 import pytest
 
+from agent_quality.collector.ui_api import execute_ui_action
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-MEDIA_DIR = PROJECT_ROOT / "vscode-extension" / "media"
 STATIC_DIR = PROJECT_ROOT / "src" / "agent_quality" / "collector" / "static"
 EXTENSION_SOURCE = PROJECT_ROOT / "vscode-extension" / "src" / "extension.js"
+EXTENSION_SCRIPTS = PROJECT_ROOT / "vscode-extension" / "scripts"
+EXTENSION_GITIGNORE = PROJECT_ROOT / "vscode-extension" / ".gitignore"
+PANEL_SOURCE = PROJECT_ROOT / "vscode-extension" / "src" / "dashboard-panel.js"
+FLYWHEEL_SOURCE = PROJECT_ROOT / "vscode-extension" / "src" / "flywheel-panel.js"
+RUNTIME_SOURCE = PROJECT_ROOT / "vscode-extension" / "src" / "runtime.js"
 EXTENSION_PACKAGE = PROJECT_ROOT / "vscode-extension" / "package.json"
 
 
 @pytest.mark.parametrize("asset", ["dashboard.html", "dashboard.css", "dashboard.js"])
-def test_dashboard_assets_stay_synchronized(asset):
-    assert (MEDIA_DIR / asset).read_bytes() == (STATIC_DIR / asset).read_bytes()
+def test_dashboard_assets_have_one_tracked_source_and_an_explicit_generator(asset):
+    assert (STATIC_DIR / asset).is_file()
+    source = (EXTENSION_SCRIPTS / "sync-dashboard-assets.js").read_text(encoding="utf-8")
+    assert asset in source or "const assets" in source
+    assert f"/media/{asset}" in EXTENSION_GITIGNORE.read_text(encoding="utf-8")
+
+
+def test_extension_entrypoint_is_only_a_composition_root():
+    source = EXTENSION_SOURCE.read_text(encoding="utf-8")
+
+    assert len(source.splitlines()) < 150
+    assert "String.raw`" not in source
+    assert "SELECT " not in source
+    for module in ("commands", "dashboard-panel", "flywheel-panel", "runs-tree"):
+        assert f'require("./{module}")' in source
+
+
+def test_repository_discovery_scrubs_inherited_git_selection_environment():
+    source = RUNTIME_SOURCE.read_text(encoding="utf-8")
+    root_discovery = source.split("function projectRootPath(folder)", 1)[1].split(
+        "function commandWorkingDirectory", 1
+    )[0]
+
+    for name in (
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_INDEX_FILE",
+        "GIT_NAMESPACE",
+        "GIT_CEILING_DIRECTORIES",
+    ):
+        assert f'"{name}"' in source
+    assert "delete env[name]" in root_discovery
+    assert "env," in root_discovery
+
+
+def test_dashboard_selection_waits_for_webview_ready_handshake():
+    panel = PANEL_SOURCE.read_text(encoding="utf-8")
+    dashboard = (STATIC_DIR / "dashboard.js").read_text(encoding="utf-8")
+    init = dashboard.split("function init()", 1)[1].split(
+        "function initSidebarResize", 1
+    )[0]
+
+    assert "setTimeout(() => this.selectRun" not in panel
+    assert 'message.command === "ready"' in panel
+    assert "this.pendingSelection" in panel
+    listener = init.index('window.addEventListener("message", handleHostMessage)')
+    ready = init.index('vscode.postMessage({ command: "ready" })')
+    assert listener < ready
 
 
 def test_dashboard_keeps_machine_fields_out_of_the_primary_ui():
-    source = (MEDIA_DIR / "dashboard.js").read_text(encoding="utf-8")
+    source = (STATIC_DIR / "dashboard.js").read_text(encoding="utf-8")
     render_runs = source.split("function renderRuns()", 1)[1].split("function filteredRuns()", 1)[0]
     filtered_runs = source.split("function filteredRuns()", 1)[1].split("function renderDetail(", 1)[0]
     overview = source.split("function renderOverview(", 1)[1].split("function renderVerifiers(", 1)[0]
@@ -42,7 +94,7 @@ def test_dashboard_keeps_machine_fields_out_of_the_primary_ui():
 
 
 def test_delete_chat_control_is_vscode_chat_only():
-    source = (MEDIA_DIR / "dashboard.js").read_text(encoding="utf-8")
+    source = (STATIC_DIR / "dashboard.js").read_text(encoding="utf-8")
 
     assert 'vscode && state.viewMode === "chats"' in source
     assert 'data-action="deleteChat"' in source
@@ -52,7 +104,7 @@ def test_delete_chat_control_is_vscode_chat_only():
 
 
 def test_dashboard_can_copy_transcript_without_tool_executions():
-    source = (MEDIA_DIR / "dashboard.js").read_text(encoding="utf-8")
+    source = (STATIC_DIR / "dashboard.js").read_text(encoding="utf-8")
 
     assert 'data-action="copyNoToolsTranscript"' in source
     assert 'copyTranscript("no-tools")' in source
@@ -95,11 +147,10 @@ def test_dashboard_details_compacts_large_payloads(tmp_path, monkeypatch):
         )
     conn.close()
 
-    result = _run_dashboard_action(db_path, "details", {"run_id": "run_large"})
+    payload = execute_ui_action("details", {"run_id": "run_large"}, db_path=db_path)
+    encoded = json.dumps(payload)
 
-    assert result.returncode == 0, result.stderr
-    assert len(result.stdout) < 250_000
-    payload = json.loads(result.stdout)
+    assert len(encoded) < 250_000
     event = payload["events"][0]
     assert len(event["normalized_payload"]) < 2500
     assert "[truncated:" in event["normalized_payload"]
@@ -109,26 +160,26 @@ def test_dashboard_details_compacts_large_payloads(tmp_path, monkeypatch):
 
 
 def test_delete_chat_confirmation_precedes_database_mutation():
-    source = EXTENSION_SOURCE.read_text(encoding="utf-8")
-    handler = source.split('if (message.command === "deleteChat")', 1)[1].split(
-        'if (message.command === "openFile")', 1
+    source = PANEL_SOURCE.read_text(encoding="utf-8")
+    handler = source.split("async deleteChat(message)", 1)[1].split(
+        "authorizedFile(filePath)", 1
     )[0]
 
     confirmation = handler.index("showWarningMessage")
     cancellation = handler.index("confirmation !== DELETE_CHAT_CONFIRMATION")
-    mutation = handler.index('dashboardDbQuery(folder, "delete_chat"')
+    mutation = handler.index('runUiApi(this.folder, "delete_chat"')
     assert confirmation < cancellation < mutation
     assert 'deleted: false' in handler
 
 
 def test_flywheel_panel_is_vscode_only_and_uses_external_worker():
-    source = EXTENSION_SOURCE.read_text(encoding="utf-8")
+    source = FLYWHEEL_SOURCE.read_text(encoding="utf-8")
     package = json.loads(EXTENSION_PACKAGE.read_text(encoding="utf-8"))
 
     assert "class FlywheelPanel" in source
     assert 'shell: false' in source
-    assert 'dashboardDbQuery(folder, "flywheel_candidates"' in source
-    assert 'DashboardPanel.show(this.context, message.run_id, "overview")' in source
+    assert 'runUiApi(this.folder, "flywheel_candidates")' in source
+    assert "this.openRun(message.run_id)" in source
     assert "flywheel.html" not in (STATIC_DIR / "dashboard.html").read_text(encoding="utf-8")
     assert any(command["command"] == "agentQuality.showFlywheel" for command in package["contributes"]["commands"])
     properties = package["contributes"]["configuration"]["properties"]
@@ -213,10 +264,9 @@ def test_delete_chat_removes_session_records_but_preserves_files_and_global_meta
         _insert_failure_instance(conn, "failure_keep", "run_keep")
     conn.close()
 
-    result = _run_dashboard_action(db_path, "delete_chat", {"chat_id": "ses_delete"})
+    result = execute_ui_action("delete_chat", {"chat_id": "ses_delete"}, db_path=db_path)
 
-    assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout) == {
+    assert result == {
         "chat_id": "ses_delete",
         "chat_type": "session",
         "deleted": True,
@@ -254,10 +304,9 @@ def test_delete_chat_removes_standalone_run(tmp_path, monkeypatch):
         _insert_event(conn, "evt_keep", run_id="run_keep", session_id=None)
     conn.close()
 
-    result = _run_dashboard_action(db_path, "delete_chat", {"chat_id": "run_delete"})
+    result = execute_ui_action("delete_chat", {"chat_id": "run_delete"}, db_path=db_path)
 
-    assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout)["chat_type"] == "standalone_run"
+    assert result["chat_type"] == "standalone_run"
     conn = connect(db_path)
     assert _ids(conn, "runs") == {"run_keep"}
     assert _ids(conn, "events") == {"evt_keep"}
@@ -274,29 +323,11 @@ def test_delete_chat_rejects_unknown_id_without_mutation(tmp_path, monkeypatch):
         _insert_event(conn, "evt_keep", run_id="run_keep", session_id=None)
     conn.close()
 
-    result = _run_dashboard_action(db_path, "delete_chat", {"chat_id": "missing"})
-
-    assert result.returncode != 0
-    assert "unknown chat: missing" in result.stderr
+    with pytest.raises(ValueError, match="unknown chat: missing"):
+        execute_ui_action("delete_chat", {"chat_id": "missing"}, db_path=db_path)
     conn = connect(db_path)
     assert _ids(conn, "runs") == {"run_keep"}
     assert _ids(conn, "events") == {"evt_keep"}
-
-
-def _dashboard_db_script() -> str:
-    source = EXTENSION_SOURCE.read_text(encoding="utf-8")
-    return source.split("const DASHBOARD_DB_SCRIPT = String.raw`", 1)[1].split(
-        "\n`;\n\nfunction dashboardDbQuery", 1
-    )[0]
-
-
-def _run_dashboard_action(db_path: Path, action: str, payload: dict) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [sys.executable, "-c", _dashboard_db_script(), str(db_path), action, json.dumps(payload)],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
 
 
 def _insert_session(conn, session_id: str) -> None:
