@@ -439,8 +439,15 @@ def _auto_redact(val: Any) -> Any:
 
 
 def connect(path: Path | str | None = None) -> sqlite3.Connection:
-    ensure_home()
-    conn = sqlite3.connect(path or default_db_path())
+    if path is None:
+        ensure_home()
+        database: Path | str = default_db_path()
+    elif str(path) == ":memory:":
+        database = ":memory:"
+    else:
+        database = Path(path).expanduser()
+        database.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(database)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     _ensure_schema(conn)

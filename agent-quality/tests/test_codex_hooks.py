@@ -1,5 +1,6 @@
 import json
 
+from agent_quality.adapters import codex_hooks
 from agent_quality.adapters.codex_hooks import ingest_hook_event
 from agent_quality.db import all_rows, connect, one
 
@@ -60,6 +61,66 @@ def test_user_prompt_submit_creates_visible_run(tmp_path, monkeypatch):
     assert run["agent_status"] == "prompt_submitted"
     assert run["verifier_status"] == "unverified"
     assert session["task_summary"] == "explain the prompt dashboard"
+
+
+def test_user_prompt_session_summary_is_redacted(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_QUALITY_HOME", str(tmp_path))
+    secret = "sk-123456789012345678901234567890"
+
+    ingest_hook_event(
+        "UserPromptSubmit",
+        {
+            "event_id": "evt_prompt_redaction",
+            "session_id": "ses_prompt_redaction",
+            "prompt": f"investigate {secret}",
+        },
+    )
+
+    session = one(connect(), "SELECT task_summary FROM sessions WHERE id=?", ["ses_prompt_redaction"])
+    assert secret not in session["task_summary"]
+    assert session["task_summary"] == "investigate [REDACTED:openai_api_key]"
+
+
+def test_user_prompt_session_summary_redacts_before_truncating(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_QUALITY_HOME", str(tmp_path))
+    secret = "sk-123456789012345678901234567890"
+
+    ingest_hook_event(
+        "UserPromptSubmit",
+        {
+            "event_id": "evt_prompt_boundary_redaction",
+            "session_id": "ses_prompt_boundary_redaction",
+            "prompt": f"{'x' * 225} {secret} trailing text",
+        },
+    )
+
+    session = one(
+        connect(),
+        "SELECT task_summary FROM sessions WHERE id=?",
+        ["ses_prompt_boundary_redaction"],
+    )
+    assert secret not in session["task_summary"]
+    assert "sk-" not in session["task_summary"]
+    assert "[REDACTED" in session["task_summary"]
+    assert len(session["task_summary"]) <= 240
+
+
+def test_duplicate_user_prompt_turn_creates_one_run_and_event(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_QUALITY_HOME", str(tmp_path))
+    payload = {
+        "session_id": "ses_duplicate_prompt",
+        "turn_id": "turn_duplicate_prompt",
+        "prompt": "capture this prompt once",
+    }
+
+    first_id = ingest_hook_event("UserPromptSubmit", payload)
+    second_id = ingest_hook_event("UserPromptSubmit", payload)
+
+    conn = connect()
+    assert second_id == first_id
+    assert len(all_rows(conn, "SELECT id FROM sessions")) == 1
+    assert len(all_rows(conn, "SELECT id FROM runs")) == 1
+    assert len(all_rows(conn, "SELECT id FROM events")) == 1
 
 
 def test_stop_hook_records_assistant_output_and_file_links(tmp_path, monkeypatch):
@@ -156,3 +217,32 @@ def test_stop_hook_imports_only_emitted_reasoning_from_current_turn(tmp_path, mo
         "I found the capture boundary.",
     ]
     assert all("encrypted_content" not in item for item in trace)
+
+
+def test_duplicate_stop_does_not_repeat_transcript_side_effects(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_QUALITY_HOME", str(tmp_path))
+    ingest_hook_event(
+        "UserPromptSubmit",
+        {
+            "event_id": "evt_duplicate_stop_prompt",
+            "session_id": "ses_duplicate_stop",
+            "prompt": "finish once",
+        },
+    )
+    transcript_calls: list[tuple[str, str | None]] = []
+
+    def record_transcript_call(conn, payload, *, run_id, session_id):
+        transcript_calls.append((run_id, session_id))
+
+    monkeypatch.setattr(codex_hooks, "_ingest_transcript_reasoning", record_transcript_call)
+    payload = {
+        "session_id": "ses_duplicate_stop",
+        "turn_id": "turn_duplicate_stop",
+        "last_assistant_message": "Done.",
+    }
+
+    first_id = ingest_hook_event("Stop", payload)
+    second_id = ingest_hook_event("Stop", payload)
+
+    assert second_id == first_id
+    assert len(transcript_calls) == 1

@@ -3,22 +3,37 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
 from agent_quality import __version__
+from agent_quality.adapters.hook_runtime import (
+    HookRuntime,
+    resolve_hook_runtime,
+    spool_hook_failure,
+)
 from agent_quality.collector.envelope import make_envelope, normalize_envelope
 from agent_quality.db import connect, insert
 from agent_quality.hashutil import sha256_text
 from agent_quality.ids import new_id
+from agent_quality.privacy.redaction import redact_text
 from agent_quality.timeutil import utc_now
+
 
 MARKDOWN_FILE_LINK_RE = re.compile(r"\[[^\]]+\]\((/[^)\n]+?)(?::(\d+))?\)")
 
 
-def ingest_hook_event(event_name: str, payload: dict[str, Any], *, db_path: Path | None = None) -> str:
+def ingest_hook_event(
+    event_name: str,
+    payload: dict[str, Any],
+    *,
+    db_path: Path | None = None,
+    repository_path: Path | str | None = None,
+) -> str:
+    repository = Path(repository_path or Path.cwd()).expanduser().resolve()
     run_id = _first_string(payload, "run_id", "runId")
     session_id = _first_string(payload, "session_id", "sessionId", "thread_id", "threadId")
     tool_name = _first_string(payload, "tool_name", "toolName", "tool", "name")
@@ -58,10 +73,11 @@ def ingest_hook_event(event_name: str, payload: dict[str, Any], *, db_path: Path
     if prompt:
         run_id = run_id or _prompt_run_id(payload, session_id, prompt)
         data["prompt"] = prompt
+    idempotency_key = _hook_idempotency_key(event_name, payload, session_id=session_id)
 
     with connect(db_path) as conn:
         if prompt:
-            _store_prompt_run(conn, run_id, session_id, prompt, payload)
+            _store_prompt_run(conn, run_id, session_id, prompt, payload, repository_path=repository)
         elif not run_id and session_id:
             run_id = _active_run_id(conn, session_id)
 
@@ -77,33 +93,137 @@ def ingest_hook_event(event_name: str, payload: dict[str, Any], *, db_path: Path
             extensions={"openai.codex.hook": payload},
         )
         row = normalize_envelope(envelope)
+        if idempotency_key is not None:
+            row["idempotency_key"] = idempotency_key
+        event_id = row["id"]
+        inserted = True
         try:
             insert(conn, "events", row)
-        except Exception as exc:
-            if "UNIQUE constraint failed" not in str(exc):
+        except sqlite3.IntegrityError:
+            if idempotency_key is None:
                 raise
-        if event_name == "Stop" and run_id:
+            existing = conn.execute(
+                "SELECT id FROM events WHERE idempotency_key=?",
+                [idempotency_key],
+            ).fetchone()
+            if existing is None:
+                raise
+            event_id = existing["id"]
+            inserted = False
+        if inserted and event_name == "Stop" and run_id:
             _ingest_transcript_reasoning(conn, payload, run_id=run_id, session_id=session_id)
             _close_run(conn, run_id, "completed" if assistant_output else "observed", row["observed_at"])
-    return row["id"]
+    return event_id
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = argv or sys.argv[1:]
     event_name = argv[0] if argv else os.environ.get("CODEX_HOOK_EVENT", "UnknownHook")
+    runtime: HookRuntime | None = None
+    payload: dict[str, Any] = {}
     try:
         text = sys.stdin.read()
-        payload = json.loads(text) if text.strip() else {}
-        event_id = ingest_hook_event(event_name, payload)
-        print(json.dumps({"ok": True, "event_id": event_id}))
+        parsed = json.loads(text) if text.strip() else {}
+        if not isinstance(parsed, dict):
+            raise ValueError("hook payload must be a JSON object")
+        payload = parsed
+        runtime = resolve_hook_runtime("codex", payload)
+        if runtime is None:
+            return 0
+        ingest_hook_event(
+            event_name,
+            payload,
+            db_path=runtime.db_path,
+            repository_path=runtime.repository_path,
+        )
         return 0
     except Exception as exc:
-        spool_dir = Path(os.environ.get("AGENT_QUALITY_SPOOL", ".agent-quality/local/spool"))
-        spool_dir.mkdir(parents=True, exist_ok=True)
-        spool_path = spool_dir / f"hook-failed-{new_id('evt')}.json"
-        spool_path.write_text(json.dumps({"event": event_name, "error": str(exc)}, sort_keys=True), encoding="utf-8")
-        print(json.dumps({"ok": False, "spooled": str(spool_path)}), file=sys.stderr)
+        if runtime is None:
+            try:
+                runtime = resolve_hook_runtime("codex", payload)
+            except Exception:
+                runtime = None
+        if runtime is None:
+            return 0
+        try:
+            spool_path = spool_hook_failure(
+                runtime,
+                provider="codex",
+                event_name=event_name,
+                payload=payload,
+                error=exc,
+            )
+        except Exception:
+            spool_path = None
+        diagnostic: dict[str, Any] = {"ok": False, "capture_failed": True}
+        if spool_path is not None:
+            diagnostic["spooled"] = str(spool_path)
+        print(json.dumps(diagnostic, sort_keys=True), file=sys.stderr)
         return 0
+
+
+def _hook_idempotency_key(
+    event_name: str,
+    payload: dict[str, Any],
+    *,
+    session_id: str | None,
+) -> str | None:
+    explicit_id = _top_level_string(
+        payload,
+        "event_id",
+        "eventId",
+        "hook_event_id",
+        "hookEventId",
+        "idempotency_key",
+        "idempotencyKey",
+    )
+    turn_id = _top_level_string(payload, "turn_id", "turnId")
+    tool_use_id = _top_level_string(
+        payload,
+        "tool_use_id",
+        "toolUseId",
+        "tool_call_id",
+        "toolCallId",
+        "call_id",
+        "callId",
+    )
+    request_id = _top_level_string(payload, "request_id", "requestId")
+
+    if explicit_id:
+        occurrence = {"kind": "event", "id": explicit_id}
+    elif event_name in {"PreToolUse", "PostToolUse"} and tool_use_id:
+        occurrence = {"kind": "tool", "turn_id": turn_id, "tool_use_id": tool_use_id}
+    elif event_name == "UserPromptSubmit" and turn_id:
+        occurrence = {"kind": "turn", "turn_id": turn_id}
+    elif event_name == "Stop" and turn_id:
+        occurrence = {"kind": "stop", "turn_id": turn_id}
+    elif event_name == "PermissionRequest" and (request_id or tool_use_id):
+        occurrence = {
+            "kind": "permission",
+            "request_id": request_id,
+            "tool_use_id": tool_use_id,
+        }
+    else:
+        return None
+
+    material = json.dumps(
+        {
+            "event": event_name,
+            "session_id": session_id,
+            "occurrence": occurrence,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return f"codex-hook:{sha256_text(material)}"
+
+
+def _top_level_string(payload: dict[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
 
 
 def _first_string(payload: dict[str, Any], *keys: str) -> str | None:
@@ -145,12 +265,23 @@ def _prompt_text(event_name: str, payload: dict[str, Any]) -> str | None:
 
 
 def _prompt_run_id(payload: dict[str, Any], session_id: str | None, prompt: str) -> str:
-    existing = _first_string(payload, "event_id", "eventId", "id", "idempotency_key", "idempotencyKey")
+    existing = _top_level_string(
+        payload,
+        "event_id",
+        "eventId",
+        "hook_event_id",
+        "hookEventId",
+        "idempotency_key",
+        "idempotencyKey",
+    )
+    turn_id = _top_level_string(payload, "turn_id", "turnId")
     sequence = _first_int(payload, "sequence", "sequence_number", "sequenceNumber")
     if existing:
-        key = existing
+        key = f"event:{existing}"
+    elif turn_id:
+        key = f"turn:{session_id or ''}:{turn_id}"
     elif session_id and sequence is not None:
-        key = f"{session_id}:{sequence}:{sha256_text(prompt)}"
+        key = f"sequence:{session_id}:{sequence}:{sha256_text(prompt)}"
     else:
         return new_id("run")
     return f"run_{sha256_text(key)[:32]}"
@@ -417,20 +548,35 @@ def _strip_line_suffix(path: str) -> str:
     return prefix if suffix.isdigit() else path
 
 
-def _store_prompt_run(conn, run_id: str, session_id: str | None, prompt: str, payload: dict[str, Any]) -> None:
+def _store_prompt_run(
+    conn,
+    run_id: str,
+    session_id: str | None,
+    prompt: str,
+    payload: dict[str, Any],
+    *,
+    repository_path: Path,
+) -> None:
     started_at = (
         _first_string(payload, "occurred_at", "occurredAt", "timestamp", "time", "created_at", "createdAt")
         or utc_now()
     )
-    repo_path = str(Path.cwd().resolve())
+    repo_path = str(repository_path)
     if session_id:
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO sessions (
-                id, repository_path, repository_remote_hash, started_at, ended_at, final_outcome, task_summary
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (session_id, repo_path, None, started_at, None, None, prompt[:240]),
+        task_summary = redact_text(prompt).value[:240]
+        insert(
+            conn,
+            "sessions",
+            {
+                "id": session_id,
+                "repository_path": repo_path,
+                "repository_remote_hash": None,
+                "started_at": started_at,
+                "ended_at": None,
+                "final_outcome": None,
+                "task_summary": task_summary,
+            },
+            or_action="OR IGNORE",
         )
         turn_number = (
             conn.execute("SELECT COALESCE(MAX(turn_number), 0) + 1 AS n FROM runs WHERE session_id=?", [session_id])

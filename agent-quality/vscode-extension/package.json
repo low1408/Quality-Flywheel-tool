@@ -2,7 +2,7 @@
   "name": "agent-quality-vscode",
   "displayName": "Agent Quality",
   "description": "VS Code commands and views for the Agent Quality local sidecar.",
-  "version": "0.1.13",
+  "version": "0.1.14",
   "publisher": "agent-quality",
   "license": "MIT",
   "repository": {
@@ -24,8 +24,8 @@
     "onCommand:agentQuality.initProject",
     "onCommand:agentQuality.runPrompt",
     "onCommand:agentQuality.runSelection",
-    "onCommand:agentQuality.installCodexHooks",
-    "onCommand:agentQuality.installAntigravityHooks",
+    "onCommand:agentQuality.installUserHooks",
+    "onCommand:agentQuality.hookStatus",
     "onCommand:agentQuality.startCollector",
     "onCommand:agentQuality.stopCollector",
     "onCommand:agentQuality.reportSummary",
@@ -70,12 +70,12 @@
         "title": "Agent Quality: Run Selection"
       },
       {
-        "command": "agentQuality.installCodexHooks",
-        "title": "Agent Quality: Install Codex Hooks"
+        "command": "agentQuality.installUserHooks",
+        "title": "Agent Quality: Install User Hooks"
       },
       {
-        "command": "agentQuality.installAntigravityHooks",
-        "title": "Agent Quality: Install Antigravity Hooks"
+        "command": "agentQuality.hookStatus",
+        "title": "Agent Quality: Show User Hook Status"
       },
       {
         "command": "agentQuality.startCollector",
@@ -188,8 +188,8 @@
         },
         "agentQuality.pythonPath": {
           "type": "string",
-          "default": "python3",
-          "description": "Python executable passed to aq install-codex-hooks."
+          "default": "",
+          "description": "Optional Python executable embedded by aq hooks install. When empty, the installer uses the interpreter running aq."
         },
         "agentQuality.home": {
           "type": "string",

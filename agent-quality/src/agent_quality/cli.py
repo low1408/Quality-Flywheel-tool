@@ -2,16 +2,27 @@ from __future__ import annotations
 
 import argparse
 import json
-import shlex
 import sqlite3
 import sys
 from pathlib import Path
 
-from agent_quality.adapters.codex_hooks import main as codex_hook_main
 from agent_quality.adapters.antigravity import main as antigravity_hook_main
+from agent_quality.adapters.codex_hooks import main as codex_hook_main
+from agent_quality.adapters.hook_runtime import (
+    CONSENT_MARKER_NAME,
+    initialize_project_consent,
+    validate_project_consent_location,
+)
 from agent_quality.collector.envelope import normalize_envelope
 from agent_quality.collector.server import serve
 from agent_quality.db import all_rows, connect, insert, one
+from agent_quality.hook_installation import (
+    HookConfigError,
+    HookResult,
+    hooks_status,
+    install_hooks,
+    uninstall_hooks,
+)
 from agent_quality.orchestrator import run_task
 from agent_quality.regressions.registry import promote
 from agent_quality.reports.metrics import summary
@@ -46,13 +57,15 @@ def main(argv: list[str] | None = None) -> None:
     antigravity_hook = hook_sub.add_parser("antigravity")
     antigravity_hook.add_argument("event")
 
-    install_hooks = sub.add_parser("install-codex-hooks")
-    install_hooks.add_argument("--repo", default=".")
-    install_hooks.add_argument("--python", default=sys.executable)
-
-    install_antigravity_hooks = sub.add_parser("install-antigravity-hooks")
-    install_antigravity_hooks.add_argument("--repo", default=".")
-    install_antigravity_hooks.add_argument("--python", default=sys.executable)
+    hooks = sub.add_parser("hooks")
+    hooks_sub = hooks.add_subparsers(dest="hooks_command", required=True)
+    hooks_install = hooks_sub.add_parser("install")
+    hooks_install.add_argument("--provider", choices=("codex", "antigravity", "all"), default="all")
+    hooks_install.add_argument("--python", default=sys.executable)
+    hooks_status_parser = hooks_sub.add_parser("status")
+    hooks_status_parser.add_argument("--provider", choices=("codex", "antigravity", "all"), default="all")
+    hooks_uninstall = hooks_sub.add_parser("uninstall")
+    hooks_uninstall.add_argument("--provider", choices=("codex", "antigravity", "all"), default="all")
 
     server = sub.add_parser("serve-collector")
     server.add_argument("--host", default="127.0.0.1")
@@ -100,10 +113,8 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(codex_hook_main([args.event]))
     elif args.command == "hook" and args.hook == "antigravity":
         raise SystemExit(antigravity_hook_main([args.event]))
-    elif args.command == "install-codex-hooks":
-        _install_codex_hooks(Path(args.repo), args.python)
-    elif args.command == "install-antigravity-hooks":
-        _install_antigravity_hooks(Path(args.repo), args.python)
+    elif args.command == "hooks":
+        _run_hooks_command(args)
     elif args.command == "serve-collector":
         serve(args.host, args.port, token=args.token)
     elif args.command == "review":
@@ -124,10 +135,26 @@ def main(argv: list[str] | None = None) -> None:
 def _init_project(repo: Path) -> None:
     repo = _project_root(repo)
     aq = repo / ".agent-quality"
-    (aq / "cases").mkdir(parents=True, exist_ok=True)
+    cases = aq / "cases"
     verify = aq / "verify.yaml"
     protected = aq / "protected-paths.txt"
     config = aq / "config.yaml"
+    gitignore = aq / ".gitignore"
+    local = aq / "local"
+    consent = local / CONSENT_MARKER_NAME
+
+    for path in (aq, cases, local):
+        if path.is_symlink() or (path.exists() and not path.is_dir()):
+            raise SystemExit(f"error: refusing unsafe Agent Quality directory: {path}")
+    for path in (verify, protected, config, gitignore, consent):
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            raise SystemExit(f"error: refusing unsafe Agent Quality file: {path}")
+    try:
+        validate_project_consent_location(repo)
+    except ValueError as exc:
+        raise SystemExit(f"error: {exc}") from exc
+
+    cases.mkdir(parents=True, exist_ok=True)
     if not verify.exists():
         verify.write_text(
             "\n".join(
@@ -150,74 +177,52 @@ def _init_project(repo: Path) -> None:
         protected.write_text(".agent-quality/**\n", encoding="utf-8")
     if not config.exists():
         config.write_text("version: 1\n", encoding="utf-8")
+    if not gitignore.exists():
+        gitignore.write_text("local/\n", encoding="utf-8")
+    elif "local/" not in {line.strip() for line in gitignore.read_text(encoding="utf-8").splitlines()}:
+        existing = gitignore.read_text(encoding="utf-8")
+        separator = "" if not existing or existing.endswith("\n") else "\n"
+        gitignore.write_text(f"{existing}{separator}local/\n", encoding="utf-8")
+    try:
+        initialize_project_consent(repo)
+    except ValueError as exc:
+        raise SystemExit(f"error: {exc}") from exc
     print(f"initialized {aq}")
 
 
-def _install_codex_hooks(repo: Path, python: str) -> None:
-    repo = _project_root(repo)
-    codex_dir = repo / ".codex"
-    codex_dir.mkdir(parents=True, exist_ok=True)
-    aq_home = repo / ".agent-quality" / "local"
-    aq_home.mkdir(parents=True, exist_ok=True)
-    tool_src = Path(__file__).resolve().parents[1]
-    command = (
-        f"AGENT_QUALITY_HOME={shlex.quote(str(aq_home))} "
-        f"PYTHONPATH={shlex.quote(str(tool_src))} "
-        f"{shlex.quote(python)} -m agent_quality.cli hook codex"
-    )
-    hooks = {
-        "hooks": {
-            "SessionStart": [{"hooks": [{"type": "command", "command": f"{command} SessionStart"}]}],
-            "UserPromptSubmit": [{"hooks": [{"type": "command", "command": f"{command} UserPromptSubmit"}]}],
-            "PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": f"{command} PreToolUse"}]}],
-            "PostToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": f"{command} PostToolUse"}]}],
-            "PermissionRequest": [{"matcher": "*", "hooks": [{"type": "command", "command": f"{command} PermissionRequest"}]}],
-            "Stop": [{"hooks": [{"type": "command", "command": f"{command} Stop", "timeout": 30}]}],
-        }
-    }
-    (codex_dir / "hooks.json").write_text(json.dumps(hooks, indent=2) + "\n", encoding="utf-8")
-    _ensure_codex_hooks_enabled(codex_dir / "config.toml")
-    print(f"installed Codex hooks: {codex_dir / 'hooks.json'}")
-    print(f"enabled Codex hooks: {codex_dir / 'config.toml'}")
+def _run_hooks_command(args: argparse.Namespace) -> None:
+    try:
+        if args.hooks_command == "install":
+            results = install_hooks(args.provider, args.python)
+            for result in results:
+                state = "installed" if result.changed else "already installed"
+                print(f"{result.provider}: {state} ({result.path})")
+            _print_codex_trust_note(results)
+        elif args.hooks_command == "status":
+            results = hooks_status(args.provider)
+            for result in results:
+                state = "installed" if result.installed else "not installed"
+                print(f"{result.provider}: {state} ({result.path})")
+            _print_codex_trust_note(results)
+        elif args.hooks_command == "uninstall":
+            results = uninstall_hooks(args.provider)
+            for result in results:
+                state = "uninstalled" if result.changed else "not installed"
+                print(f"{result.provider}: {state} ({result.path})")
+    except HookConfigError as exc:
+        raise SystemExit(f"error: {exc}") from exc
 
 
-def _install_antigravity_hooks(repo: Path, python: str) -> None:
-    repo = _project_root(repo)
-    agents_dir = repo / ".agents"
-    agents_dir.mkdir(parents=True, exist_ok=True)
-    aq_home = repo / ".agent-quality" / "local"
-    aq_home.mkdir(parents=True, exist_ok=True)
-    tool_src = Path(__file__).resolve().parents[1]
-    command = (
-        f"AGENT_QUALITY_HOME={shlex.quote(str(aq_home))} "
-        f"PYTHONPATH={shlex.quote(str(tool_src))} "
-        f"{shlex.quote(python)} -m agent_quality.cli hook antigravity"
-    )
-    
-    antigravity_hooks = {
-        "PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": f"{command} PreToolUse"}]}],
-        "PostToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": f"{command} PostToolUse"}]}],
-        "PreInvocation": [{"hooks": [{"type": "command", "command": f"{command} PreInvocation"}]}],
-        "PostInvocation": [{"hooks": [{"type": "command", "command": f"{command} PostInvocation"}]}],
-        "Stop": [{"hooks": [{"type": "command", "command": f"{command} Stop", "timeout": 30}]}]
-    }
-
-    hooks_file = agents_dir / "hooks.json"
-    
-    # Safe Merging to prevent overwriting shared workspace hooks
-    existing_data: dict[str, Any] = {}
-    if hooks_file.exists():
-        try:
-            existing_data = json.loads(hooks_file.read_text(encoding="utf-8"))
-            if not isinstance(existing_data, dict):
-                existing_data = {}
-        except Exception:
-            existing_data = {}
-
-    existing_data["agent-quality"] = antigravity_hooks
-    
-    hooks_file.write_text(json.dumps(existing_data, indent=2) + "\n", encoding="utf-8")
-    print(f"installed Antigravity hooks: {hooks_file}")
+def _print_codex_trust_note(results: list[HookResult]) -> None:
+    for result in results:
+        if result.provider != "codex":
+            continue
+        print(
+            "codex: trust is not verified by aq; in a terminal, cd to the repository "
+            f"and run codex, then use /hooks to trust {result.path}; afterward start "
+            "a new IDE chat"
+        )
+        return
 
 
 def _project_root(repo: Path) -> Path:
@@ -228,40 +233,6 @@ def _project_root(repo: Path) -> Path:
         if (candidate / ".git").exists():
             return candidate
     return path
-
-
-def _ensure_codex_hooks_enabled(config_path: Path) -> None:
-    if not config_path.exists():
-        config_path.write_text("[features]\nhooks = true\n", encoding="utf-8")
-        return
-
-    lines = config_path.read_text(encoding="utf-8").splitlines()
-    features_start: int | None = None
-    next_table = len(lines)
-    for index, line in enumerate(lines):
-        stripped = line.strip()
-        if stripped == "[features]":
-            features_start = index
-            continue
-        if features_start is not None and index > features_start and stripped.startswith("[") and stripped.endswith("]"):
-            next_table = index
-            break
-
-    if features_start is None:
-        suffix = "" if not lines or lines[-1] == "" else "\n"
-        config_path.write_text("\n".join(lines) + f"{suffix}\n[features]\nhooks = true\n", encoding="utf-8")
-        return
-
-    for index in range(features_start + 1, next_table):
-        stripped = lines[index].strip()
-        if "=" in stripped and stripped.split("=", 1)[0].strip() == "hooks":
-            indent = lines[index][: len(lines[index]) - len(lines[index].lstrip())]
-            lines[index] = f"{indent}hooks = true"
-            config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-            return
-
-    lines.insert(features_start + 1, "hooks = true")
-    config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def _ingest(path: str | None) -> None:

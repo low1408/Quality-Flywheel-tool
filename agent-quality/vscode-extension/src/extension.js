@@ -2,6 +2,7 @@
 
 const cp = require("child_process");
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const vscode = require("vscode");
 
@@ -28,8 +29,8 @@ function activate(context) {
   register(context, "agentQuality.initProject", initProject);
   register(context, "agentQuality.runPrompt", runPrompt);
   register(context, "agentQuality.runSelection", runSelection);
-  register(context, "agentQuality.installCodexHooks", installCodexHooks);
-  register(context, "agentQuality.installAntigravityHooks", installAntigravityHooks);
+  register(context, "agentQuality.installUserHooks", installUserHooks);
+  register(context, "agentQuality.hookStatus", hookStatus);
   register(context, "agentQuality.startCollector", startCollector);
   register(context, "agentQuality.stopCollector", stopCollector);
   register(context, "agentQuality.reportSummary", reportSummary);
@@ -119,25 +120,26 @@ async function runMeasuredPrompt(folder, prompt) {
   runsProvider.refresh();
 }
 
-async function installCodexHooks() {
-  const folder = await pickWorkspaceFolder();
-  if (!folder) {
-    return;
+async function installUserHooks() {
+  const folder = optionalWorkspaceFolder();
+  const args = ["hooks", "install", "--provider", "all"];
+  const pythonPath = getConfig().get("pythonPath");
+  if (pythonPath) {
+    args.push("--python", pythonPath);
   }
-  const pythonPath = getConfig().get("pythonPath") || "python3";
-  await runAq(["install-codex-hooks", "--repo", projectRootPath(folder), "--python", pythonPath], folder, {
-    title: "Install Codex hooks"
+  await runAq(args, folder, {
+    title: "Install user hooks",
+    reveal: true,
+    projectHome: false
   });
 }
 
-async function installAntigravityHooks() {
-  const folder = await pickWorkspaceFolder();
-  if (!folder) {
-    return;
-  }
-  const pythonPath = getConfig().get("pythonPath") || "python3";
-  await runAq(["install-antigravity-hooks", "--repo", projectRootPath(folder), "--python", pythonPath], folder, {
-    title: "Install Antigravity hooks"
+async function hookStatus() {
+  const folder = optionalWorkspaceFolder();
+  await runAq(["hooks", "status", "--provider", "all"], folder, {
+    title: "User hook status",
+    reveal: true,
+    projectHome: false
   });
 }
 
@@ -226,8 +228,8 @@ async function runAq(args, folder, options) {
 
   return new Promise((resolve) => {
     const child = cp.spawn(invocation.command, [...invocation.prefixArgs, ...args], {
-      cwd: projectRootPath(folder),
-      env: commandEnv(folder),
+      cwd: commandWorkingDirectory(folder),
+      env: commandEnv(folder, { projectHome: options.projectHome !== false }),
       shell: false
     });
     let stderr = "";
@@ -1786,11 +1788,11 @@ function configuredVerifyPath(folder) {
   return fs.existsSync(defaultPath) ? defaultPath : undefined;
 }
 
-function commandEnv(folder) {
-  const env = {
-    ...process.env,
-    AGENT_QUALITY_HOME: agentQualityHome(folder)
-  };
+function commandEnv(folder, options = {}) {
+  const env = { ...process.env };
+  if (options.projectHome !== false) {
+    env.AGENT_QUALITY_HOME = agentQualityHome(folder);
+  }
   const sourceRoot = cliSourceRoot(folder);
   if (sourceRoot) {
     const srcPath = path.join(sourceRoot, "src");
@@ -1818,7 +1820,7 @@ function aqInvocation(folder) {
 
 function cliSourceRoot(folder) {
   const configured = getConfig().get("cliSourceRoot");
-  const repo = projectRootPath(folder);
+  const repo = commandWorkingDirectory(folder);
   if (configured) {
     return path.isAbsolute(configured) ? configured : path.join(repo, configured);
   }
@@ -1924,6 +1926,26 @@ function projectRootPath(folder) {
     }
     current = parent;
   }
+}
+
+function commandWorkingDirectory(folder) {
+  if (folder) {
+    return projectRootPath(folder);
+  }
+  const current = process.cwd();
+  try {
+    if (fs.statSync(current).isDirectory()) {
+      return current;
+    }
+  } catch {
+    // Fall back to the user's home when the extension host cwd is unavailable.
+  }
+  return os.homedir();
+}
+
+function optionalWorkspaceFolder() {
+  const folders = vscode.workspace.workspaceFolders || [];
+  return folders[0];
 }
 
 async function pickWorkspaceFolder() {
