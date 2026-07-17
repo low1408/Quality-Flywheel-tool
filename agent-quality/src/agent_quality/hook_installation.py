@@ -61,6 +61,14 @@ class _WritePlan:
     data: dict[str, Any] | None = None
 
 
+@dataclass(frozen=True)
+class _FileSnapshot:
+    write_path: Path
+    existed: bool
+    contents: bytes | None
+    mode: int | None
+
+
 def hook_path(
     provider: Provider,
     *,
@@ -106,14 +114,12 @@ def hooks_status(
     """Report whether every expected Agent Quality hook is installed."""
 
     results: list[HookResult] = []
-    runtime_cache: dict[Path, bool] = {}
     for selected in _providers(provider):
         path = hook_path(selected, home=home, environ=environ)
         data = _read_json_object(path)
         installed = _provider_is_enabled(selected, path, data) and _is_installed(
             selected,
             data,
-            runtime_cache=runtime_cache,
         )
         results.append(HookResult(selected, path, installed))
     return results
@@ -233,9 +239,32 @@ def _plan_uninstall(provider: Provider, path: Path) -> _WritePlan:
 
 
 def _apply(plans: list[_WritePlan]) -> list[HookResult]:
-    for plan in plans:
-        if plan.data is not None:
-            _atomic_write_json(plan.result.path, plan.data)
+    changed_plans = [plan for plan in plans if plan.data is not None]
+    snapshots = {
+        plan.result.path: _snapshot_file(plan.result.path)
+        for plan in changed_plans
+    }
+    written: list[Path] = []
+    try:
+        for plan in changed_plans:
+            _atomic_write_json(plan.result.path, cast(dict[str, Any], plan.data))
+            written.append(plan.result.path)
+    except HookConfigError as exc:
+        rollback_errors: list[str] = []
+        for path in reversed(written):
+            try:
+                _restore_snapshot(snapshots[path])
+            except HookConfigError as rollback_exc:
+                rollback_errors.append(str(rollback_exc))
+        if rollback_errors:
+            changed = ", ".join(str(path) for path in written)
+            raise HookConfigError(
+                f"{exc}; rollback failed after changing {changed}: "
+                + "; ".join(rollback_errors)
+            ) from exc
+        if written:
+            raise HookConfigError(f"{exc}; earlier provider changes were rolled back") from exc
+        raise
     return [plan.result for plan in plans]
 
 
@@ -337,8 +366,6 @@ def _provider_is_enabled(provider: Provider, path: Path, data: dict[str, Any]) -
 def _is_installed(
     provider: Provider,
     data: dict[str, Any],
-    *,
-    runtime_cache: dict[Path, bool],
 ) -> bool:
     if provider == "codex":
         hooks = data.get("hooks")
@@ -347,7 +374,6 @@ def _is_installed(
                 hooks.get(event),
                 provider,
                 event,
-                runtime_cache=runtime_cache,
             )
             for event in _CODEX_EVENTS
         )
@@ -365,14 +391,12 @@ def _is_installed(
                 hooks.get(event),
                 provider,
                 event,
-                runtime_cache=runtime_cache,
             )
             if event in _ANTIGRAVITY_MATCHER_EVENTS
             else _direct_event_is_installed(
                 hooks.get(event),
                 provider,
                 event,
-                runtime_cache=runtime_cache,
             )
         )
         for event in _ANTIGRAVITY_EVENTS
@@ -383,8 +407,6 @@ def _grouped_event_is_installed(
     groups: Any,
     provider: Provider,
     event: str,
-    *,
-    runtime_cache: dict[Path, bool],
 ) -> bool:
     if not isinstance(groups, list):
         return False
@@ -393,7 +415,6 @@ def _grouped_event_is_installed(
             hook,
             provider,
             event,
-            runtime_cache=runtime_cache,
         )
         for group in groups
         if (
@@ -409,15 +430,12 @@ def _direct_event_is_installed(
     handlers: Any,
     provider: Provider,
     event: str,
-    *,
-    runtime_cache: dict[Path, bool],
 ) -> bool:
     return isinstance(handlers, list) and any(
         _is_runnable_agent_quality_hook(
             handler,
             provider,
             event,
-            runtime_cache=runtime_cache,
         )
         for handler in handlers
     )
@@ -432,17 +450,13 @@ def _is_runnable_agent_quality_hook(
     hook: Any,
     provider: Provider,
     event: str,
-    *,
-    runtime_cache: dict[Path, bool],
 ) -> bool:
     python = _configured_python(hook, provider, event)
     if python is None:
         return False
-    if not python.is_absolute() or not python.is_file() or not os.access(python, os.X_OK):
-        return False
-    if python not in runtime_cache:
-        runtime_cache[python] = _python_can_import_agent_quality(python)
-    return runtime_cache[python]
+    # Status is deliberately structural and never executes a command parsed
+    # from provider-owned JSON. Installation performs the isolated import probe.
+    return python.is_absolute() and python.is_file() and os.access(python, os.X_OK)
 
 
 def _configured_python(hook: Any, provider: Provider, event: str) -> Path | None:
@@ -524,6 +538,40 @@ def _read_json_object(path: Path) -> dict[str, Any]:
 
 
 def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
+    contents = (json.dumps(data, indent=2) + "\n").encode("utf-8")
+    _atomic_write_bytes(path, contents)
+
+
+def _snapshot_file(path: Path) -> _FileSnapshot:
+    write_path = path.resolve(strict=False) if path.is_symlink() else path
+    if not write_path.exists():
+        return _FileSnapshot(write_path, False, None, None)
+    try:
+        return _FileSnapshot(
+            write_path,
+            True,
+            write_path.read_bytes(),
+            stat.S_IMODE(write_path.stat().st_mode),
+        )
+    except OSError as exc:
+        raise HookConfigError(f"cannot snapshot {path} before updating it: {exc}") from exc
+
+
+def _restore_snapshot(snapshot: _FileSnapshot) -> None:
+    if snapshot.existed:
+        _atomic_write_bytes(
+            snapshot.write_path,
+            snapshot.contents or b"",
+            mode=snapshot.mode,
+        )
+        return
+    try:
+        snapshot.write_path.unlink(missing_ok=True)
+    except OSError as exc:
+        raise HookConfigError(f"cannot remove newly created {snapshot.write_path}: {exc}") from exc
+
+
+def _atomic_write_bytes(path: Path, contents: bytes, *, mode: int | None = None) -> None:
     write_path = path.resolve(strict=False) if path.is_symlink() else path
     try:
         write_path.parent.mkdir(parents=True, exist_ok=True)
@@ -537,13 +585,15 @@ def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
     temporary_path = Path(temporary_name)
     try:
         try:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                json.dump(data, stream, indent=2)
-                stream.write("\n")
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(contents)
                 stream.flush()
                 os.fsync(stream.fileno())
-            if write_path.exists():
-                os.chmod(temporary_path, stat.S_IMODE(write_path.stat().st_mode))
+            target_mode = mode
+            if target_mode is None and write_path.exists():
+                target_mode = stat.S_IMODE(write_path.stat().st_mode)
+            if target_mode is not None:
+                os.chmod(temporary_path, target_mode)
             os.replace(temporary_path, write_path)
         except OSError as exc:
             raise HookConfigError(f"cannot atomically write {path}: {exc}") from exc

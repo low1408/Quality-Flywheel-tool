@@ -201,7 +201,7 @@ def _run_hooks_command(args: argparse.Namespace) -> None:
         elif args.hooks_command == "status":
             results = hooks_status(args.provider)
             for result in results:
-                state = "installed" if result.installed else "not installed"
+                state = "configured" if result.installed else "not configured"
                 print(f"{result.provider}: {state} ({result.path})")
             _print_codex_trust_note(results)
         elif args.hooks_command == "uninstall":
@@ -215,12 +215,12 @@ def _run_hooks_command(args: argparse.Namespace) -> None:
 
 def _print_codex_trust_note(results: list[HookResult]) -> None:
     for result in results:
-        if result.provider != "codex":
+        if result.provider != "codex" or not result.installed:
             continue
         print(
             "codex: trust is not verified by aq; in a terminal, cd to the repository "
-            f"and run codex, then use /hooks to trust {result.path}; afterward start "
-            "a new IDE chat"
+            f"and open the interactive Codex CLI (not IDE chat), then use /hooks to "
+            f"trust {result.path}; afterward start a new IDE chat"
         )
         return
 
