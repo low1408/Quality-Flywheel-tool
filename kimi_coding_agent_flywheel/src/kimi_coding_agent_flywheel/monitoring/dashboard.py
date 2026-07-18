@@ -21,6 +21,8 @@ from typing import Any, Callable, Protocol
 
 import numpy as np
 
+from ..timeutil import naive_utc_now
+
 
 # -----------------------------------------------------------------------------
 # Data Structures
@@ -83,12 +85,12 @@ class TimeSeriesMetric:
     values: deque[tuple[datetime, float]] = field(default_factory=lambda: deque(maxlen=10000))
 
     def add(self, value: float, timestamp: datetime | None = None) -> None:
-        ts = timestamp or datetime.utcnow()
+        ts = timestamp or naive_utc_now()
         self.values.append((ts, value))
 
     def get_window(self, window_minutes: int = 60) -> list[float]:
         """Get values within the specified time window."""
-        cutoff = datetime.utcnow() - timedelta(minutes=window_minutes)
+        cutoff = naive_utc_now() - timedelta(minutes=window_minutes)
         return [v for ts, v in self.values if ts >= cutoff]
 
     def get_stats(self, window_minutes: int = 60) -> dict[str, float]:
@@ -216,7 +218,7 @@ class ProductionMonitor:
 
     def compute_metrics(self, window_minutes: int = 60) -> dict[str, dict[str, float]]:
         """Compute all metrics for the specified time window."""
-        cutoff = datetime.utcnow() - timedelta(minutes=window_minutes)
+        cutoff = naive_utc_now() - timedelta(minutes=window_minutes)
         recent = [t for t in self.recent_traces if t.timestamp >= cutoff]
 
         if not recent:
@@ -292,8 +294,8 @@ class ProductionMonitor:
 
         if sr_drop > self.thresholds["success_rate_critical"]:
             new_alerts.append(DriftAlert(
-                alert_id=f"sr_critical_{datetime.utcnow().strftime('%H%M%S')}",
-                timestamp=datetime.utcnow(),
+                alert_id=f"sr_critical_{naive_utc_now().strftime('%H%M%S')}",
+                timestamp=naive_utc_now(),
                 alert_type="performance",
                 severity="critical",
                 metric_name="success_rate",
@@ -305,8 +307,8 @@ class ProductionMonitor:
             ))
         elif sr_drop > self.thresholds["success_rate_drop"]:
             new_alerts.append(DriftAlert(
-                alert_id=f"sr_warn_{datetime.utcnow().strftime('%H%M%S')}",
-                timestamp=datetime.utcnow(),
+                alert_id=f"sr_warn_{naive_utc_now().strftime('%H%M%S')}",
+                timestamp=naive_utc_now(),
                 alert_type="performance",
                 severity="warning",
                 metric_name="success_rate",
@@ -326,8 +328,8 @@ class ProductionMonitor:
             # Get most common recent failures
             recent_failures = self._get_top_failures(60, 3)
             new_alerts.append(DriftAlert(
-                alert_id=f"er_critical_{datetime.utcnow().strftime('%H%M%S')}",
-                timestamp=datetime.utcnow(),
+                alert_id=f"er_critical_{naive_utc_now().strftime('%H%M%S')}",
+                timestamp=naive_utc_now(),
                 alert_type="behavioral",
                 severity="critical",
                 metric_name="error_rate",
@@ -346,8 +348,8 @@ class ProductionMonitor:
             cost_increase = (current_cost - baseline_cost) / baseline_cost
             if cost_increase > self.thresholds["cost_increase"]:
                 new_alerts.append(DriftAlert(
-                    alert_id=f"cost_warn_{datetime.utcnow().strftime('%H%M%S')}",
-                    timestamp=datetime.utcnow(),
+                    alert_id=f"cost_warn_{naive_utc_now().strftime('%H%M%S')}",
+                    timestamp=naive_utc_now(),
                     alert_type="cost",
                     severity="warning",
                     metric_name="avg_cost",
@@ -368,7 +370,7 @@ class ProductionMonitor:
 
     def _get_top_failures(self, window_minutes: int, n: int) -> list[tuple[str, int]]:
         """Get the most common failures in the recent window."""
-        cutoff = datetime.utcnow() - timedelta(minutes=window_minutes)
+        cutoff = naive_utc_now() - timedelta(minutes=window_minutes)
         counts: dict[str, int] = {}
 
         for subcategory, events in self.failure_counts.items():
@@ -384,7 +386,7 @@ class ProductionMonitor:
 
     def get_failure_trends(self, window_hours: int = 24) -> dict[str, list[tuple[str, int]]]:
         """Get failure trends over time buckets."""
-        now = datetime.utcnow()
+        now = naive_utc_now()
         buckets: dict[str, dict[str, int]] = {}
 
         for subcategory, events in self.failure_counts.items():
@@ -413,7 +415,7 @@ class ProductionMonitor:
         # Recent alerts
         recent_alerts = [
             a.to_dict() for a in self.alerts
-            if a.timestamp > datetime.utcnow() - timedelta(hours=24)
+            if a.timestamp > naive_utc_now() - timedelta(hours=24)
         ]
 
         # Failure distribution
@@ -423,7 +425,7 @@ class ProductionMonitor:
         recent_traces = [t.to_dict() for t in list(self.recent_traces)[-100:]]
 
         return {
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": naive_utc_now().isoformat(),
             "metrics": metrics,
             "baselines": self.baselines if self.baseline_established else None,
             "recent_alerts": recent_alerts,
@@ -538,7 +540,7 @@ class UserFeedbackCollector:
             "was_correct": was_correct,
             "user_notes": user_notes,
             "user_correction": user_correction,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": naive_utc_now().isoformat(),
         }
 
         self.feedback_entries.append(entry)
@@ -546,7 +548,7 @@ class UserFeedbackCollector:
 
     def get_incorrect_outputs(self, since_hours: int = 24) -> list[dict[str, Any]]:
         """Get all incorrect outputs for analysis."""
-        cutoff = datetime.utcnow() - timedelta(hours=since_hours)
+        cutoff = naive_utc_now() - timedelta(hours=since_hours)
         return [
             e for e in self.feedback_entries
             if not e["was_correct"] and datetime.fromisoformat(e["timestamp"]) >= cutoff

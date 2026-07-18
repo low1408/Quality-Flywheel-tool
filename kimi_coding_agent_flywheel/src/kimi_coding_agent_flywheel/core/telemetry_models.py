@@ -11,6 +11,7 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import Any
 
+from ..timeutil import naive_utc_now
 
 
 class EventType(Enum):
@@ -187,7 +188,7 @@ class Trace:
     model_id: str | None = None
     task_id: str | None = None
 
-    start_time: datetime = field(default_factory=datetime.utcnow)
+    start_time: datetime = field(default_factory=naive_utc_now)
     end_time: datetime | None = None
 
     events: list[TraceEvent] = field(default_factory=list)
@@ -212,7 +213,7 @@ class Trace:
     def duration_sec(self) -> float:
         if self.end_time:
             return (self.end_time - self.start_time).total_seconds()
-        return (datetime.utcnow() - self.start_time).total_seconds()
+        return (naive_utc_now() - self.start_time).total_seconds()
 
     @property
     def event_counts(self) -> dict[str, int]:
@@ -262,7 +263,7 @@ class Trace:
         span = TraceSpan(
             span_id=sid,
             name=name,
-            start_time=datetime.utcnow(),
+            start_time=naive_utc_now(),
             parent_span_id=parent_span_id,
             metadata=metadata,
         )
@@ -273,7 +274,7 @@ class Trace:
     def end_span(self, span_id: str) -> None:
         """End an open span."""
         if span_id in self._open_spans:
-            self._open_spans[span_id].end_time = datetime.utcnow()
+            self._open_spans[span_id].end_time = naive_utc_now()
             del self._open_spans[span_id]
 
     def finalize(self) -> None:
@@ -281,7 +282,7 @@ class Trace:
         # Close all open spans
         for span_id in list(self._open_spans.keys()):
             self.end_span(span_id)
-        self.end_time = datetime.utcnow()
+        self.end_time = naive_utc_now()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -311,7 +312,7 @@ class Trace:
         dir_path = Path(directory)
         dir_path.mkdir(parents=True, exist_ok=True)
 
-        filename = f"{self.trace_id}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
+        filename = f"{self.trace_id}_{naive_utc_now().strftime('%Y%m%d_%H%M%S')}.json"
         filepath = dir_path / filename
 
         with open(filepath, "w") as f:

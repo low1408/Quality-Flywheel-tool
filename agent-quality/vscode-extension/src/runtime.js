@@ -6,6 +6,11 @@ const os = require("os");
 const path = require("path");
 const vscode = require("vscode");
 
+const {
+  MIN_UI_API_AQ_VERSION,
+  assertUiApiCompatible
+} = require("./compatibility");
+
 const AQ_COMMAND_MAX_BUFFER = 10 * 1024 * 1024;
 const UI_API_MAX_BUFFER = 10 * 1024 * 1024;
 const GIT_REPOSITORY_ENV = [
@@ -17,6 +22,7 @@ const GIT_REPOSITORY_ENV = [
   "GIT_NAMESPACE",
   "GIT_CEILING_DIRECTORIES"
 ];
+const uiApiCompatibilityChecks = new Map();
 
 function execAq(args, folder) {
   const invocation = aqInvocation(folder);
@@ -37,7 +43,8 @@ function execAq(args, folder) {
   });
 }
 
-function runUiApi(folder, action, payload = {}) {
+async function runUiApi(folder, action, payload = {}) {
+  await ensureUiApiCompatibility(folder);
   const invocation = aqInvocation(folder);
   return new Promise((resolve, reject) => {
     const child = cp.execFile(
@@ -64,6 +71,46 @@ function runUiApi(folder, action, payload = {}) {
     );
     child.stdin.on("error", (err) => reject(err));
     child.stdin.end(`${JSON.stringify(payload)}\n`, "utf8");
+  });
+}
+
+function ensureUiApiCompatibility(folder) {
+  const invocation = aqInvocation(folder);
+  const projectRoot = projectRootPath(folder);
+  const sourceRoot = cliSourceRoot(folder) || "";
+  const key = JSON.stringify([invocation.commandLine, projectRoot, sourceRoot]);
+  if (!uiApiCompatibilityChecks.has(key)) {
+    const check = new Promise((resolve, reject) => {
+      cp.execFile(
+        invocation.command,
+        [...invocation.prefixArgs, "--version"],
+        {
+          cwd: projectRoot,
+          env: commandEnv(folder),
+          timeout: 5000,
+          windowsHide: true,
+          maxBuffer: 64 * 1024
+        },
+        (err, stdout, stderr) => {
+          const output = `${stdout || ""}\n${stderr || ""}`.trim();
+          try {
+            if (err) throw new Error(output || err.message);
+            resolve(assertUiApiCompatible(output));
+          } catch (compatibilityError) {
+            reject(new Error(
+              `Agent Quality ${MIN_UI_API_AQ_VERSION} or newer is required by `
+              + `this extension. Configure agentQuality.aqCommand to a compatible `
+              + `installation. ${compatibilityError.message}`
+            ));
+          }
+        }
+      );
+    });
+    uiApiCompatibilityChecks.set(key, check);
+  }
+  return uiApiCompatibilityChecks.get(key).catch((err) => {
+    uiApiCompatibilityChecks.delete(key);
+    throw err;
   });
 }
 
@@ -247,10 +294,6 @@ async function pickWorkspaceFolder() {
   return picked && picked.folder;
 }
 
-function firstWorkspaceFolder() {
-  return (vscode.workspace.workspaceFolders || [])[0];
-}
-
 function getConfig() {
   return vscode.workspace.getConfiguration("agentQuality");
 }
@@ -272,8 +315,8 @@ module.exports = {
   commandEnv,
   commandWorkingDirectory,
   configuredVerifyPath,
+  ensureUiApiCompatibility,
   execAq,
-  firstWorkspaceFolder,
   getConfig,
   optionalWorkspaceFolder,
   pickWorkspaceFolder,

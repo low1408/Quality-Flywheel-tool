@@ -62,6 +62,22 @@ def test_save_review_api_updates_existing_review(tmp_path, monkeypatch):
     assert run["human_status"] == "accepted_cleanly"
 
 
+def test_save_review_api_redacts_notes_on_insert_and_update(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_QUALITY_HOME", str(tmp_path))
+    conn = connect()
+    with conn:
+        _insert_run(conn, "run_secret", "not_reviewed", "2026-01-01T00:00:00.000Z")
+
+    first_secret = "sk-abcdefghijklmnopqrstuvwxyz123456"
+    second_secret = "ghp_abcdefghijklmnopqrstuvwxyz123456"
+    save_review_api("run_secret", "rejected", notes=f"first {first_secret}")
+    save_review_api("run_secret", "rejected", notes=f"second {second_secret}")
+
+    review = one(conn, "SELECT notes FROM human_reviews WHERE run_id=?", ["run_secret"])
+    assert second_secret not in review["notes"]
+    assert review["notes"] == "second [REDACTED:github_token]"
+
+
 def _insert_run(conn, run_id: str, human_status: str, started_at: str) -> None:
     insert(
         conn,

@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
 
+from ..timeutil import naive_utc_now
 from ..eval.evaluators import Evaluator
 from .agents import CodingAgent
 from .benchmark_models import AgentOutput, BenchmarkTask, Difficulty, EvaluationResult, TaskType
@@ -129,7 +129,7 @@ class BenchmarkSuite:
         """Execute and evaluate a single task."""
         # Run the agent
         output = await agent.execute(task)
-        output.end_time = datetime.utcnow()
+        output.end_time = naive_utc_now()
 
         # Store the output for later analysis
         await self._store_agent_output(output)
@@ -155,7 +155,7 @@ class BenchmarkSuite:
         out_dir = Path("data/outputs") / output.agent_name
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        filename = f"{output.task_id.stable_id}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
+        filename = f"{output.task_id.stable_id}_{naive_utc_now().strftime('%Y%m%d_%H%M%S')}.json"
         filepath = out_dir / filename
 
         with open(filepath, "w") as f:

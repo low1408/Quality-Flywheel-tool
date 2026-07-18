@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from datetime import datetime
-
 from kimi_coding_agent_flywheel.core.benchmark_models import (
     BenchmarkTask,
     Difficulty,
@@ -22,6 +20,7 @@ from kimi_coding_agent_flywheel.regression.models import (
     RegressionResult,
     RegressionTest,
 )
+from kimi_coding_agent_flywheel.timeutil import naive_utc_now
 from kimi_coding_agent_flywheel.regression.suite import RegressionSuite
 
 
@@ -67,7 +66,7 @@ def test_trace_round_trip_preserves_spans_counters_and_step_sequence(tmp_path) -
     first_event = TraceEvent(
         event_id="event-one",
         event_type=EventType.LLM_REQUEST,
-        timestamp=datetime.utcnow(),
+        timestamp=naive_utc_now(),
         step_number=-1,
         span_id=span_id,
         tokens_in=2,
@@ -85,7 +84,7 @@ def test_trace_round_trip_preserves_spans_counters_and_step_sequence(tmp_path) -
     next_event = TraceEvent(
         event_id="event-two",
         event_type=EventType.TOOL_CALL,
-        timestamp=datetime.utcnow(),
+        timestamp=naive_utc_now(),
         step_number=-1,
     )
     restored.add_event(next_event)

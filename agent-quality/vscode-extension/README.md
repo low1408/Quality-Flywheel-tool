@@ -26,7 +26,8 @@ The command works without an open workspace and manages hooks in `$CODEX_HOME/ho
 Extension 0.1.15 requires Agent Quality 0.2.0 or later. It uses the CLI's
 versioned, allowlisted `ui-api` contract for dashboard data and keeps database
 access in the Python collector package. The same hook setup remains available
-through the `aq hooks` CLI.
+through the `aq hooks` CLI. Dashboard and flywheel requests preflight the
+configured `aq` executable and show a configuration error when it is too old.
 
 Each repository opts in separately. Open it and run **Agent Quality: Initialize Project**, or use:
 
@@ -72,6 +73,13 @@ By default, extension commands set `AGENT_QUALITY_HOME` to:
 ```
 
 This repository-local setting applies to run, collector, report, and dashboard operations. User hook install and status commands intentionally do not set it, and globally installed provider hooks ignore `AGENT_QUALITY_HOME` so it cannot bypass per-project initialization.
+
+In a multi-root workspace, the Runs view groups results by Git repository.
+Workspace folders that resolve to the same repository are shown only once.
+
+Setting `agentQuality.collectorToken` passes the token to `aq serve-collector`.
+All collector API routes then require bearer authentication; the standalone
+browser dashboard prompts for the token and stores it only in session storage.
 
 Override `agentQuality.aqCommand` if `aq` is not on `PATH`.
 

@@ -57,6 +57,7 @@
     min: 260,
     storageKey: "agentQuality.sidebarWidth"
   };
+  const dashboardTokenKey = "agentQuality.collectorBearerToken";
   const elements = {};
 
   document.addEventListener("DOMContentLoaded", init);
@@ -1092,8 +1093,21 @@ Here is the trace:
     });
   }
 
-  async function fetchJson(url, options) {
-    const response = await fetch(url, options);
+  async function fetchJson(url, options, allowTokenPrompt = true) {
+    const requestOptions = { ...(options || {}) };
+    requestOptions.headers = { ...((options && options.headers) || {}) };
+    const token = window.sessionStorage.getItem(dashboardTokenKey);
+    if (token) {
+      requestOptions.headers.Authorization = `Bearer ${token}`;
+    }
+    const response = await fetch(url, requestOptions);
+    if (response.status === 401 && allowTokenPrompt && !vscode) {
+      const supplied = window.prompt("Agent Quality collector bearer token");
+      if (supplied) {
+        window.sessionStorage.setItem(dashboardTokenKey, supplied.trim());
+        return fetchJson(url, options, false);
+      }
+    }
     let payload = null;
     try {
       payload = await response.json();

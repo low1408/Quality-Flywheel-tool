@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from ..timeutil import naive_utc_now
 from .models import RegressionReport, RegressionResult, RegressionTest
 
 # -----------------------------------------------------------------------------
@@ -48,7 +48,7 @@ class RegressionSuite:
         This is the key mechanism for the flywheel:
         diagnosed failures -> regression tests -> prevent recurrence
         """
-        test_id = f"reg_{failure_id}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+        test_id = f"reg_{failure_id}_{naive_utc_now().strftime('%Y%m%d_%H%M%S')}"
 
         test = RegressionTest(
             test_id=test_id,
@@ -76,7 +76,7 @@ class RegressionSuite:
             "avg_score": avg_score,
             "cost": cost,
             "per_task_results": per_task_results,
-            "established_at": datetime.utcnow().isoformat(),
+            "established_at": naive_utc_now().isoformat(),
         }
 
     def establish_all_baselines(self, results: dict[str, dict[str, Any]]) -> None:
@@ -109,7 +109,7 @@ class RegressionSuite:
         Returns:
             RegressionReport with full comparison
         """
-        run_id = run_id or f"run_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+        run_id = run_id or f"run_{naive_utc_now().strftime('%Y%m%d_%H%M%S')}"
 
         report = RegressionReport(
             run_id=run_id,
@@ -222,7 +222,7 @@ class RegressionSuite:
         # Record execution
         test.execution_history.append({
             "run_id": run_id,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": naive_utc_now().isoformat(),
             "passed": result.passed,
             "pass_rate": result.pass_rate,
             "avg_score": result.avg_score,
@@ -337,10 +337,9 @@ class RegressionSuite:
                     task=task_data,
                     derived_from_failure=case_data.get("source", {}).get("run_id"),
                     derived_from_cluster=None,
-                    created_date=datetime.utcnow(),
+                    created_date=naive_utc_now(),
                 )
                 self.add_test(test)
             except Exception as e:
                 import sys
                 print(f"Warning: Failed to load regression case {case_dir.name}: {e}", file=sys.stderr)
-

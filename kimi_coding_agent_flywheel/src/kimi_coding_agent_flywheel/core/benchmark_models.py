@@ -8,6 +8,8 @@ from datetime import datetime
 from enum import Enum, auto
 from typing import Any
 
+from ..timeutil import naive_utc_now
+
 # -----------------------------------------------------------------------------
 # Core Types
 # -----------------------------------------------------------------------------
@@ -172,7 +174,7 @@ class AgentOutput:
     execution_trajectory: list[TrajectoryStep] = field(default_factory=list)
 
     # Timing and resources
-    start_time: datetime = field(default_factory=datetime.utcnow)
+    start_time: datetime = field(default_factory=naive_utc_now)
     end_time: datetime | None = None
     total_tokens: int = 0
     cost_usd: float = 0.0
@@ -239,7 +241,7 @@ class AgentOutput:
             start_time=(
                 datetime.fromisoformat(start_time)
                 if isinstance(start_time, str)
-                else datetime.utcnow()
+                else naive_utc_now()
             ),
             end_time=datetime.fromisoformat(end_time) if isinstance(end_time, str) else None,
             total_tokens=int(data.get("total_tokens", 0)),
@@ -260,7 +262,7 @@ class ToolCall:
     arguments: dict[str, Any]
     result: Any | None = None
     error: str | None = None
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+    timestamp: datetime = field(default_factory=naive_utc_now)
     latency_ms: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
@@ -285,7 +287,7 @@ class ToolCall:
             timestamp=(
                 datetime.fromisoformat(timestamp)
                 if isinstance(timestamp, str)
-                else datetime.utcnow()
+                else naive_utc_now()
             ),
             latency_ms=float(data.get("latency_ms", 0.0)),
         )
@@ -298,7 +300,7 @@ class TrajectoryStep:
     step_type: str  # "thought", "action", "observation", "error", "completion"
     content: str
     tool_call: ToolCall | None = None
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+    timestamp: datetime = field(default_factory=naive_utc_now)
     tokens_used: int = 0
 
     def to_dict(self) -> dict[str, Any]:
@@ -324,7 +326,7 @@ class TrajectoryStep:
             timestamp=(
                 datetime.fromisoformat(timestamp)
                 if isinstance(timestamp, str)
-                else datetime.utcnow()
+                else naive_utc_now()
             ),
             tokens_used=int(data.get("tokens_used", 0)),
         )
@@ -351,7 +353,7 @@ class EvaluationResult:
     root_cause: str | None = None
 
     # Metadata
-    evaluation_timestamp: datetime = field(default_factory=datetime.utcnow)
+    evaluation_timestamp: datetime = field(default_factory=naive_utc_now)
     evaluator_version: str = "1.0"
 
     def to_dict(self) -> dict[str, Any]:
@@ -386,7 +388,7 @@ class EvaluationResult:
             evaluation_timestamp=(
                 datetime.fromisoformat(timestamp)
                 if isinstance(timestamp, str)
-                else datetime.utcnow()
+                else naive_utc_now()
             ),
             evaluator_version=str(data.get("evaluator_version", "1.0")),
         )

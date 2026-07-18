@@ -5,10 +5,10 @@ from __future__ import annotations
 import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator
 
+from ..timeutil import naive_utc_now
 from .telemetry_models import EventType, Trace, TraceEvent
 
 current_trace: ContextVar[Trace | None] = ContextVar("current_trace", default=None)
@@ -96,7 +96,7 @@ class Tracer:
         event = TraceEvent(
             event_id=str(uuid.uuid4())[:8],
             event_type=EventType.LLM_REQUEST,
-            timestamp=datetime.utcnow(),
+            timestamp=naive_utc_now(),
             step_number=0,  # Will be set by add_event
             model=model or self.model_id,
             messages=messages,
@@ -126,7 +126,7 @@ class Tracer:
         event = TraceEvent(
             event_id=str(uuid.uuid4())[:8],
             event_type=EventType.TOOL_CALL,
-            timestamp=datetime.utcnow(),
+            timestamp=naive_utc_now(),
             step_number=0,
             tool_name=tool_name,
             tool_input=tool_input,
@@ -147,7 +147,7 @@ class Tracer:
         event = TraceEvent(
             event_id=str(uuid.uuid4())[:8],
             event_type=EventType.THOUGHT,
-            timestamp=datetime.utcnow(),
+            timestamp=naive_utc_now(),
             step_number=0,
             content=thought,
             metadata=metadata,
@@ -170,7 +170,7 @@ class Tracer:
         event = TraceEvent(
             event_id=str(uuid.uuid4())[:8],
             event_type=EventType.DECISION,
-            timestamp=datetime.utcnow(),
+            timestamp=naive_utc_now(),
             step_number=0,
             content=decision,
             decision_options=options,
@@ -194,7 +194,7 @@ class Tracer:
         event = TraceEvent(
             event_id=str(uuid.uuid4())[:8],
             event_type=EventType.ERROR,
-            timestamp=datetime.utcnow(),
+            timestamp=naive_utc_now(),
             step_number=0,
             content=error_content,
             metadata=metadata,
@@ -211,7 +211,7 @@ class Tracer:
         event = TraceEvent(
             event_id=str(uuid.uuid4())[:8],
             event_type=EventType.STATE_CHANGE,
-            timestamp=datetime.utcnow(),
+            timestamp=naive_utc_now(),
             step_number=0,
             content=f"{key}: {old_value} -> {new_value}",
             metadata={"key": key, "old": old_value, "new": new_value, **metadata},
@@ -228,7 +228,7 @@ class Tracer:
         event = TraceEvent(
             event_id=str(uuid.uuid4())[:8],
             event_type=EventType.METRIC,
-            timestamp=datetime.utcnow(),
+            timestamp=naive_utc_now(),
             step_number=0,
             content=f"{name}: {value} {unit}",
             metadata={"metric_name": name, "value": value, "unit": unit, **metadata},
@@ -261,7 +261,7 @@ class Tracer:
                 prompt=trace.system_prompt or "kimi evaluation task",
                 model=trace.model_id,
                 started_at=trace.start_time,
-                completed_at=trace.end_time or datetime.utcnow(),
+                completed_at=trace.end_time or naive_utc_now(),
                 duration_ms=duration_ms,
                 agent_status="completed" if not trace.has_errors else "failed",
                 verifier_status="passed" if not trace.has_errors else "failed",

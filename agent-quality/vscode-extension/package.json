@@ -12,7 +12,8 @@
   "scripts": {
     "sync-dashboard-assets": "node scripts/sync-dashboard-assets.js",
     "check-dashboard-assets": "node scripts/sync-dashboard-assets.js --check",
-    "check": "npm run sync-dashboard-assets && node --check src/extension.js && node --check src/runtime.js && node --check src/commands.js && node --check src/runs-tree.js && node --check src/webview.js && node --check src/dashboard-panel.js && node --check src/flywheel-panel.js && node --check media/dashboard.js && node --check media/flywheel.js && npm run check-dashboard-assets",
+    "test": "node scripts/test-compatibility.js && node scripts/test-runs-tree.js",
+    "check": "npm run sync-dashboard-assets && node --check src/extension.js && node --check src/compatibility.js && node --check src/runtime.js && node --check src/commands.js && node --check src/runs-tree.js && node --check src/webview.js && node --check src/dashboard-panel.js && node --check src/flywheel-panel.js && node --check media/dashboard.js && node --check media/flywheel.js && npm test && npm run check-dashboard-assets",
     "vscode:prepublish": "npm run sync-dashboard-assets && npm run check",
     "validate-package": "node -e \"JSON.parse(require('fs').readFileSync('package.json', 'utf8'))\""
   },

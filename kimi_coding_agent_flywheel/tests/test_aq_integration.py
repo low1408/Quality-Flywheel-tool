@@ -3,12 +3,11 @@ import pytest
 import tempfile
 import sys
 from pathlib import Path
-from datetime import datetime
-
 import agent_quality.db as aq_db
 from agent_quality.capture.artifacts import write_artifact
 from kimi_coding_agent_flywheel.core.aq_adapter import AQDbAdapter
 from kimi_coding_agent_flywheel.clustering.failure_analyzer import FailureInstance, FailureCluster
+from kimi_coding_agent_flywheel.timeutil import naive_utc_now
 
 def test_migration_adds_column(tmp_path):
     db_path = tmp_path / "old_schema.sqlite3"
@@ -107,7 +106,7 @@ def test_foreign_keys_are_enforced(tmp_path):
                     "probable_cause": "cause",
                     "suggested_fix": "fix",
                     "affected_prompt_component": "system_prompt",
-                    "timestamp": datetime.utcnow().isoformat(),
+                    "timestamp": naive_utc_now().isoformat(),
                     "llm_judge_score": 5.0,
                 }
             )
@@ -127,7 +126,7 @@ def test_ingestion_redaction_removes_secrets(tmp_path, monkeypatch):
     adapter.save_session(
         session_id=session_id,
         repository_path=str(tmp_path),
-        started_at=datetime.utcnow(),
+        started_at=naive_utc_now(),
         task_summary=f"Task with secret key {secret_key}",
     )
     
@@ -137,7 +136,7 @@ def test_ingestion_redaction_removes_secrets(tmp_path, monkeypatch):
         turn_number=1,
         prompt=f"System prompt with secret {secret_key}",
         model="gpt-4o",
-        started_at=datetime.utcnow(),
+        started_at=naive_utc_now(),
     )
     
     # Save artifact with secret
@@ -175,8 +174,8 @@ def test_save_clusters_transactional_atomicity(tmp_path):
     adapter = AQDbAdapter(db_path)
     
     # Insert prerequisite session and run
-    adapter.save_session("session_1", str(tmp_path), datetime.utcnow(), "session summary")
-    adapter.save_run("run_1", "session_1", 1, "prompt", "model", datetime.utcnow())
+    adapter.save_session("session_1", str(tmp_path), naive_utc_now(), "session summary")
+    adapter.save_run("run_1", "session_1", 1, "prompt", "model", naive_utc_now())
     
     # Initialize failure analysis run log
     analysis_id = "analysis_1"
@@ -192,7 +191,7 @@ def test_save_clusters_transactional_atomicity(tmp_path):
         subcategory="disobey_task_specification",
         description="F1 description",
         severity="high",
-        timestamp=datetime.utcnow(),
+        timestamp=naive_utc_now(),
     )
     f2 = FailureInstance(
         failure_id="fail_f2",
@@ -202,7 +201,7 @@ def test_save_clusters_transactional_atomicity(tmp_path):
         subcategory="disobey_task_specification",
         description="F2 description",
         severity="high",
-        timestamp=datetime.utcnow(),
+        timestamp=naive_utc_now(),
     )
     
     cluster = FailureCluster(

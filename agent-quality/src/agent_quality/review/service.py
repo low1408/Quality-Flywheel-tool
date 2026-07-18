@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from agent_quality.db import all_rows, connect, insert, one, update_run
+from agent_quality.db import all_rows, connect, insert, one, update_by_id, update_run
 from agent_quality.ids import new_id
 from agent_quality.review.labels import FAILURE_CATEGORIES, OUTCOMES
 from agent_quality.timeutil import utc_now
@@ -116,29 +116,7 @@ def _save_review(
         [run_id],
     )
     if existing:
-        conn.execute(
-            """
-            UPDATE human_reviews
-            SET outcome=?,
-                severity=?,
-                primary_failure_category=?,
-                confidence=?,
-                critical_event_sequence=?,
-                notes=?,
-                reviewed_at=?
-            WHERE id=?
-            """,
-            [
-                values["outcome"],
-                values["severity"],
-                values["primary_failure_category"],
-                values["confidence"],
-                values["critical_event_sequence"],
-                values["notes"],
-                values["reviewed_at"],
-                existing["id"],
-            ],
-        )
+        update_by_id(conn, "human_reviews", existing["id"], values)
         review_id = existing["id"]
     else:
         review_id = new_id("rev")

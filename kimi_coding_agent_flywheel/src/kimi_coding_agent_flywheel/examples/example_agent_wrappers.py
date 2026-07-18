@@ -10,11 +10,11 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess
-from datetime import datetime
 from pathlib import Path
 
 from ..core.benchmark import AgentOutput, BenchmarkTask, CodingAgent, TaskId
 from ..core.telemetry import Tracer
+from ..timeutil import naive_utc_now
 
 
 class CodexCLIWrapper(CodingAgent):
@@ -85,7 +85,7 @@ class CodexCLIWrapper(CodingAgent):
                         (context_dir / filename).write_text(content)
 
                 # Run Codex CLI
-                start_time = datetime.utcnow()
+                start_time = naive_utc_now()
                 self.tracer.record_metric("execution_start", 0.0)
 
                 result = subprocess.run(
@@ -96,7 +96,7 @@ class CodexCLIWrapper(CodingAgent):
                     cwd=str(context_dir) if task.context_files else None,
                 )
 
-                end_time = datetime.utcnow()
+                end_time = naive_utc_now()
                 duration = (end_time - start_time).total_seconds()
 
                 # Record execution
@@ -124,10 +124,10 @@ class CodexCLIWrapper(CodingAgent):
 
             except subprocess.TimeoutExpired:
                 self.tracer.record_error("Codex CLI execution timed out")
-                output.end_time = datetime.utcnow()
+                output.end_time = naive_utc_now()
             except Exception as e:
                 self.tracer.record_error("Codex CLI execution failed", exception=e)
-                output.end_time = datetime.utcnow()
+                output.end_time = naive_utc_now()
 
         return output
 
@@ -233,7 +233,7 @@ class ClaudeCodeWrapper(CodingAgent):
                     prompt_text,
                 ]
 
-                start_time = datetime.utcnow()
+                start_time = naive_utc_now()
 
                 process = await asyncio.create_subprocess_exec(
                     *cmd,
@@ -247,7 +247,7 @@ class ClaudeCodeWrapper(CodingAgent):
                     timeout=task.estimated_duration_sec,
                 )
 
-                end_time = datetime.utcnow()
+                end_time = naive_utc_now()
 
                 stdout_text = stdout.decode("utf-8", errors="replace")
                 stderr_text = stderr.decode("utf-8", errors="replace")
@@ -269,10 +269,10 @@ class ClaudeCodeWrapper(CodingAgent):
 
             except asyncio.TimeoutError:
                 self.tracer.record_error("Claude Code execution timed out")
-                output.end_time = datetime.utcnow()
+                output.end_time = naive_utc_now()
             except Exception as e:
                 self.tracer.record_error("Claude Code execution failed", exception=e)
-                output.end_time = datetime.utcnow()
+                output.end_time = naive_utc_now()
 
         return output
 
@@ -386,7 +386,7 @@ class OpenHandsWrapper(CodingAgent):
                 if self.runtime == "docker":
                     cmd.extend(["--runtime", "docker"])
 
-                start_time = datetime.utcnow()
+                start_time = naive_utc_now()
 
                 result = subprocess.run(
                     cmd,
@@ -395,7 +395,7 @@ class OpenHandsWrapper(CodingAgent):
                     timeout=task.estimated_duration_sec,
                 )
 
-                end_time = datetime.utcnow()
+                end_time = naive_utc_now()
 
                 # Parse OpenHands output (it produces structured logs)
                 self._parse_openhands_output(result.stdout)
@@ -413,10 +413,10 @@ class OpenHandsWrapper(CodingAgent):
 
             except subprocess.TimeoutExpired:
                 self.tracer.record_error("OpenHands execution timed out")
-                output.end_time = datetime.utcnow()
+                output.end_time = naive_utc_now()
             except Exception as e:
                 self.tracer.record_error("OpenHands execution failed", exception=e)
-                output.end_time = datetime.utcnow()
+                output.end_time = naive_utc_now()
 
         return output
 
@@ -557,6 +557,6 @@ class MockCodingAgent(CodingAgent):
                 self.tracer.record_error("Simulated failure for testing")
 
             self.tracer.record_metric("success", 1.0 if success else 0.0)
-            output.end_time = datetime.utcnow()
+            output.end_time = naive_utc_now()
 
         return output

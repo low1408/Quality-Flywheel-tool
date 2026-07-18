@@ -481,6 +481,25 @@ def update_run(conn: sqlite3.Connection, run_id: str, **values: Any) -> None:
     conn.execute(f"UPDATE runs SET {assignments} WHERE id=?", [*redacted_values.values(), run_id])
 
 
+def update_by_id(
+    conn: sqlite3.Connection,
+    table: str,
+    row_id: str,
+    values: dict[str, Any],
+) -> None:
+    """Update one ID-addressed row through the same redaction path as inserts."""
+
+    if not values:
+        return
+    _validate_table_columns(table, ["id", *values])
+    redacted_values = {column: _auto_redact(value) for column, value in values.items()}
+    assignments = ", ".join(f"{column}=?" for column in redacted_values)
+    conn.execute(
+        f"UPDATE {table} SET {assignments} WHERE id=?",
+        [*redacted_values.values(), row_id],
+    )
+
+
 def _validate_table_columns(table: str, columns: Iterable[str]) -> None:
     allowed = TABLE_SCHEMAS.get(table)
     if allowed is None:

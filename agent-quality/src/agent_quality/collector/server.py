@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
 import mimetypes
 import sqlite3
@@ -52,6 +53,8 @@ class CollectorHandler(BaseHTTPRequestHandler):
         if parsed.path in STATIC_ASSETS:
             self._send_static(STATIC_ASSETS[parsed.path])
             return
+        if parsed.path.startswith("/v1/ui/api/") and not self._authorize_api():
+            return
         if parsed.path == "/v1/ui/api/runs":
             self._handle_ui_runs()
             return
@@ -72,17 +75,14 @@ class CollectorHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path not in {"/v1/events", "/v1/ui/api/review"}:
+            self.send_error(404)
+            return
+        if not self._authorize_api():
+            return
         if parsed.path == "/v1/ui/api/review":
             self._handle_ui_review()
             return
-        if parsed.path != "/v1/events":
-            self.send_error(404)
-            return
-        if self.server.bearer_token:
-            expected = f"Bearer {self.server.bearer_token}"
-            if self.headers.get("Authorization") != expected:
-                self.send_error(401)
-                return
 
         length = self._content_length()
         if length is None:
@@ -100,16 +100,28 @@ class CollectorHandler(BaseHTTPRequestHandler):
                 except sqlite3.IntegrityError as exc:
                     if not _is_unique_constraint(exc):
                         raise
-            self.send_response(202)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"event_id": row["id"]}).encode("utf-8"))
+            self._send_json({"event_id": row["id"]}, status=202)
         except Exception as exc:
             print(f"collector rejected event: {exc}", file=sys.stderr)
             self._send_json_error(400, "invalid event payload")
 
     def log_message(self, format: str, *args: object) -> None:
         return
+
+    def _authorize_api(self) -> bool:
+        token = self.server.bearer_token
+        if not token:
+            return True
+        expected = f"Bearer {token}"
+        supplied = self.headers.get("Authorization", "")
+        if hmac.compare_digest(supplied, expected):
+            return True
+        self._send_json_error(
+            401,
+            "authentication required",
+            extra_headers={"WWW-Authenticate": 'Bearer realm="agent-quality"'},
+        )
+        return False
 
     def _content_length(self) -> int | None:
         raw = self.headers.get("Content-Length")
@@ -129,11 +141,18 @@ class CollectorHandler(BaseHTTPRequestHandler):
             return None
         return length
 
-    def _send_json_error(self, status: int, message: str) -> None:
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(json.dumps({"error": message}).encode("utf-8"))
+    def _send_json_error(
+        self,
+        status: int,
+        message: str,
+        *,
+        extra_headers: dict[str, str] | None = None,
+    ) -> None:
+        self._send_json(
+            {"error": message},
+            status=status,
+            extra_headers=extra_headers,
+        )
 
     def _handle_ui_runs(self) -> None:
         self._send_json(dashboard_runs(self.server.db_path))
@@ -231,16 +250,47 @@ class CollectorHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
+        self._send_security_headers(document=filename == "dashboard.html")
         self.end_headers()
         self.wfile.write(data)
 
-    def _send_json(self, payload: object, status: int = 200) -> None:
+    def _send_json(
+        self,
+        payload: object,
+        status: int = 200,
+        *,
+        extra_headers: dict[str, str] | None = None,
+    ) -> None:
         data = json.dumps(payload, sort_keys=True).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
+        self._send_security_headers()
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(data)
+
+    def _send_security_headers(self, *, document: bool = False) -> None:
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Cache-Control", "no-store")
+        if document:
+            self.send_header(
+                "Content-Security-Policy",
+                "; ".join(
+                    (
+                        "default-src 'self'",
+                        "img-src 'self' data:",
+                        "style-src 'self'",
+                        "script-src 'self'",
+                        "connect-src 'self'",
+                        "base-uri 'none'",
+                        "form-action 'none'",
+                        "frame-ancestors 'none'",
+                    )
+                ),
+            )
 
 
 def _is_unique_constraint(exc: sqlite3.IntegrityError) -> bool:

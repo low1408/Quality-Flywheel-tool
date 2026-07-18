@@ -10,6 +10,12 @@ This MVP implements the first foundation from `implementation_details/implementa
 - `aq review`, `aq show`, `aq diff`, `aq trace`, `aq report summary`, and `aq promote` provide the first terminal workflow.
 - `aq serve-collector` exposes a loopback HTTP ingestion endpoint for hook adapters.
 
+The collector defaults to loopback. When `--token` is supplied, every event,
+dashboard-data, file-preview, and review API request must include
+`Authorization: Bearer <token>`. Static dashboard assets remain readable so the
+browser UI can load; it prompts for the token after an authenticated API request
+is rejected and retains it only for the current browser session.
+
 Install locally:
 
 ```bash

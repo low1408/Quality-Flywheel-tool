@@ -127,17 +127,27 @@ def test_collector_serves_ui_runs_details_and_review_api(tmp_path, monkeypatch):
         conn_http.request("GET", "/v1/ui/")
         response = conn_http.getresponse()
         assert response.status == 200
+        assert response.getheader("Content-Security-Policy")
+        assert response.getheader("X-Content-Type-Options") == "nosniff"
         assert "Agent Quality" in response.read().decode("utf-8")
 
         conn_http = _connection(server)
-        conn_http.request("GET", "/v1/ui/api/runs")
+        conn_http.request(
+            "GET",
+            "/v1/ui/api/runs",
+            headers={"Authorization": "Bearer secret"},
+        )
         response = conn_http.getresponse()
         runs = json.loads(response.read())
         assert response.status == 200
         assert runs[0]["id"] == "run_ui"
 
         conn_http = _connection(server)
-        conn_http.request("GET", "/v1/ui/api/run/run_ui")
+        conn_http.request(
+            "GET",
+            "/v1/ui/api/run/run_ui",
+            headers={"Authorization": "Bearer secret"},
+        )
         response = conn_http.getresponse()
         details = json.loads(response.read())
         assert response.status == 200
@@ -159,13 +169,42 @@ def test_collector_serves_ui_runs_details_and_review_api(tmp_path, monkeypatch):
             "POST",
             "/v1/ui/api/review",
             body=body,
-            headers={"Content-Length": str(len(body)), "Content-Type": "application/json"},
+            headers={
+                "Authorization": "Bearer secret",
+                "Content-Length": str(len(body)),
+                "Content-Type": "application/json",
+            },
         )
         response = conn_http.getresponse()
         review = json.loads(response.read())
         assert response.status == 200
         assert review["outcome"] == "rejected"
         assert one(connect(db_path), "SELECT human_status FROM runs WHERE id=?", ["run_ui"])["human_status"] == "rejected"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_collector_token_protects_all_api_routes(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_QUALITY_HOME", str(tmp_path / "aq"))
+    server = _server(tmp_path, token="secret")
+    try:
+        for method, path in (
+            ("GET", "/v1/ui/api/runs"),
+            ("GET", "/v1/ui/api/sessions"),
+            ("GET", "/v1/ui/api/run/missing"),
+            ("GET", "/v1/ui/api/session/missing"),
+            ("GET", "/v1/ui/api/log?path=/tmp/missing"),
+            ("POST", "/v1/ui/api/review"),
+            ("POST", "/v1/events"),
+        ):
+            conn = _connection(server)
+            conn.request(method, path)
+            response = conn.getresponse()
+            response.read()
+            assert response.status == 401, path
+            assert response.getheader("WWW-Authenticate") == 'Bearer realm="agent-quality"'
+            assert response.getheader("X-Content-Type-Options") == "nosniff"
     finally:
         server.shutdown()
         server.server_close()

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from datetime import datetime
 from pathlib import Path
+
+from ..timeutil import naive_utc_now
 
 
 class AQLegacyImportMixin:
@@ -42,7 +43,7 @@ class AQLegacyImportMixin:
                     prompt=trace.system_prompt or "imported legacy task",
                     model=trace.model_id,
                     started_at=trace.start_time,
-                    completed_at=trace.end_time or datetime.utcnow(),
+                    completed_at=trace.end_time or naive_utc_now(),
                     duration_ms=duration_ms,
                     agent_status="completed" if not trace.has_errors else "failed",
                     verifier_status="passed" if not trace.has_errors else "failed",

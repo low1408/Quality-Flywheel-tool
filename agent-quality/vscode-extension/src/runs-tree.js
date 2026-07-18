@@ -7,7 +7,7 @@ const vscode = require("vscode");
 const {
   agentQualityHome,
   execAq,
-  firstWorkspaceFolder
+  projectRootPath
 } = require("./runtime");
 
 class RunsProvider {
@@ -25,8 +25,8 @@ class RunsProvider {
     return item;
   }
 
-  getChildren() {
-    return this.items;
+  getChildren(item) {
+    return item && Array.isArray(item.children) ? item.children : this.items;
   }
 
   dispose() {
@@ -34,26 +34,52 @@ class RunsProvider {
   }
 
   async load() {
-    const folder = firstWorkspaceFolder();
-    if (!folder) {
+    const folders = vscode.workspace.workspaceFolders || [];
+    if (!folders.length) {
       this.setItems([new MessageItem("Open a workspace to use Agent Quality")]);
       return;
     }
-    if (!fs.existsSync(path.join(agentQualityHome(folder), "quality.sqlite3"))) {
-      this.setItems([new MessageItem("No Agent Quality runs yet")]);
+    const targets = uniqueRepositoryFolders(folders);
+    const workspaces = await Promise.all(
+      targets.map(async (folder) => ({
+        folder,
+        items: await this.loadWorkspace(folder)
+      }))
+    );
+    if (workspaces.length === 1) {
+      this.setItems(workspaces[0].items);
       return;
+    }
+    this.setItems(workspaces.map(({ folder, items }) => (
+      new WorkspaceItem(folder, items)
+    )));
+  }
+
+  async loadWorkspace(folder) {
+    if (!fs.existsSync(path.join(agentQualityHome(folder), "quality.sqlite3"))) {
+      return [new MessageItem("No Agent Quality runs yet")];
     }
     try {
       const result = await execAq(["report", "summary"], folder);
-      this.setItems(parseSummary(result.stdout, folder));
+      return parseSummary(result.stdout, folder);
     } catch (err) {
-      this.setItems([new MessageItem(err.message || String(err))]);
+      return [new MessageItem(err.message || String(err))];
     }
   }
 
   setItems(items) {
     this.items = items;
     this.emitter.fire();
+  }
+}
+
+class WorkspaceItem extends vscode.TreeItem {
+  constructor(folder, children) {
+    super(folder.name, vscode.TreeItemCollapsibleState.Collapsed);
+    this.children = children;
+    this.contextValue = "workspace";
+    this.description = projectRootPath(folder);
+    this.resourceUri = folder.uri;
   }
 }
 
@@ -110,6 +136,16 @@ function iconForRun(run) {
   if (run.verifier === "passed") return "pass";
   if (run.verifier === "failed" || run.agent === "failed") return "error";
   return "circle-outline";
+}
+
+function uniqueRepositoryFolders(folders) {
+  const seen = new Set();
+  return folders.filter((folder) => {
+    const root = projectRootPath(folder);
+    if (seen.has(root)) return false;
+    seen.add(root);
+    return true;
+  });
 }
 
 async function resolveRunId(item) {

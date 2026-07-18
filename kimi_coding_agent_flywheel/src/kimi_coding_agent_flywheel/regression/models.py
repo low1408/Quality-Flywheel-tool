@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+from ..timeutil import naive_utc_now
+
 # -----------------------------------------------------------------------------
 # Core Data Structures
 # -----------------------------------------------------------------------------
@@ -37,7 +39,7 @@ class RegressionTest:
     # Origin tracking
     derived_from_failure: str | None = None  # Failure ID that prompted this test
     derived_from_cluster: int | None = None  # Cluster ID
-    created_date: datetime = field(default_factory=datetime.utcnow)
+    created_date: datetime = field(default_factory=naive_utc_now)
 
     # History
     execution_history: list[dict[str, Any]] = field(default_factory=list)
@@ -78,7 +80,7 @@ class RegressionTest:
             created_date=(
                 datetime.fromisoformat(created_date)
                 if isinstance(created_date, str)
-                else datetime.utcnow()
+                else naive_utc_now()
             ),
             execution_history=list(data.get("execution_history", [])),
         )
@@ -90,7 +92,7 @@ class RegressionResult:
     test_id: str
     test_name: str
     run_id: str
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+    timestamp: datetime = field(default_factory=naive_utc_now)
 
     # Results
     passed: bool = False
@@ -141,7 +143,7 @@ class RegressionResult:
             timestamp=(
                 datetime.fromisoformat(timestamp)
                 if isinstance(timestamp, str)
-                else datetime.utcnow()
+                else naive_utc_now()
             ),
             passed=bool(data.get("passed", False)),
             pass_rate=float(data.get("pass_rate", 0.0)),
@@ -162,7 +164,7 @@ class RegressionResult:
 class RegressionReport:
     """Comprehensive regression report across all tests."""
     run_id: str
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+    timestamp: datetime = field(default_factory=naive_utc_now)
     agent_name: str = ""
     model_id: str | None = None
     prompt_version: str = ""
@@ -213,7 +215,7 @@ class RegressionReport:
             timestamp=(
                 datetime.fromisoformat(timestamp)
                 if isinstance(timestamp, str)
-                else datetime.utcnow()
+                else naive_utc_now()
             ),
             agent_name=str(data.get("agent_name", "")),
             model_id=data.get("model_id"),

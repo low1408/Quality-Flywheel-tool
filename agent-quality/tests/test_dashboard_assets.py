@@ -14,6 +14,7 @@ EXTENSION_GITIGNORE = PROJECT_ROOT / "vscode-extension" / ".gitignore"
 PANEL_SOURCE = PROJECT_ROOT / "vscode-extension" / "src" / "dashboard-panel.js"
 FLYWHEEL_SOURCE = PROJECT_ROOT / "vscode-extension" / "src" / "flywheel-panel.js"
 RUNTIME_SOURCE = PROJECT_ROOT / "vscode-extension" / "src" / "runtime.js"
+RUNS_TREE_SOURCE = PROJECT_ROOT / "vscode-extension" / "src" / "runs-tree.js"
 EXTENSION_PACKAGE = PROJECT_ROOT / "vscode-extension" / "package.json"
 
 
@@ -68,6 +69,38 @@ def test_dashboard_selection_waits_for_webview_ready_handshake():
     listener = init.index('window.addEventListener("message", handleHostMessage)')
     ready = init.index('vscode.postMessage({ command: "ready" })')
     assert listener < ready
+
+
+def test_browser_dashboard_retries_authenticated_api_requests_with_session_token():
+    source = (STATIC_DIR / "dashboard.js").read_text(encoding="utf-8")
+    fetch_json = source.split("async function fetchJson", 1)[1].split(
+        "function renderError", 1
+    )[0]
+
+    assert "window.sessionStorage.getItem(dashboardTokenKey)" in fetch_json
+    assert "requestOptions.headers.Authorization = `Bearer ${token}`" in fetch_json
+    assert "response.status === 401" in fetch_json
+    assert "window.prompt" in fetch_json
+    assert "return fetchJson(url, options, false)" in fetch_json
+
+
+def test_extension_preflights_ui_api_version_and_groups_multi_root_runs():
+    runtime = RUNTIME_SOURCE.read_text(encoding="utf-8")
+    runs_tree = RUNS_TREE_SOURCE.read_text(encoding="utf-8")
+    package = json.loads(EXTENSION_PACKAGE.read_text(encoding="utf-8"))
+
+    run_ui_api = runtime.split("async function runUiApi", 1)[1].split(
+        "function ensureUiApiCompatibility", 1
+    )[0]
+    assert "await ensureUiApiCompatibility(folder)" in run_ui_api
+    assert '"--version"' in runtime
+    assert "MIN_UI_API_AQ_VERSION" in runtime
+    assert "vscode.workspace.workspaceFolders" in runs_tree
+    assert "uniqueRepositoryFolders" in runs_tree
+    assert "Promise.all" in runs_tree
+    assert "class WorkspaceItem" in runs_tree
+    assert "test-compatibility.js" in package["scripts"]["test"]
+    assert "test-runs-tree.js" in package["scripts"]["test"]
 
 
 def test_dashboard_keeps_machine_fields_out_of_the_primary_ui():
